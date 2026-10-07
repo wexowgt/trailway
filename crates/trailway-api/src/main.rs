@@ -25,6 +25,10 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     tracing::info!("trailway-api listening on {bind_addr}");
-    axum::serve(listener, trailway_api::router()).await?;
+    let state = trailway_api::AppState {
+        pool,
+        config: trailway_api::Config::from_env()?,
+    };
+    axum::serve(listener, trailway_api::router(state)).await?;
     Ok(())
 }
