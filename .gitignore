@@ -1,0 +1,7 @@
+/target
+.env
+node_modules
+.next
+web/next-env.d.ts
+.hive/report
+.hive/mr.url
