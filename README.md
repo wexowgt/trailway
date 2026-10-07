@@ -27,6 +27,20 @@ cargo run -p trailway-agent          # prints its version
 cd web && pnpm install && pnpm dev   # http://localhost:3000
 ```
 
+## Adding a server (agent)
+
+A user creates a server key (`POST /api/v1/server-keys`), then on the Linux box:
+
+```sh
+curl -fsSL <api>/install.sh | sudo sh -s -- --key tw_sk_... --api <api>
+```
+
+The script downloads `<api>/downloads/trailway-agent-linux-<arch>` (or `--bin-url`), writes `/etc/trailway/agent.json` (0600), installs `trailway-agent.service` and enables it (so it survives reboot). The agent calls `POST /api/v1/agent/register` with the key, stores the returned server token in `/var/lib/trailway/state.json`, then sends `POST /api/v1/agent/heartbeat` every 10 s (CPU millicores, RAM and disk bytes, KVM). No heartbeat for 30 s means offline. Re-running the installer (or re-registering the same `/etc/machine-id` for the same user) updates the existing server and rotates its token. `GET /api/v1/servers` lists the caller's servers.
+
+The API serves binaries from `API_AGENT_DIST_DIR` (files `trailway-agent-linux-x86_64` and `-aarch64`; build with `cargo zigbuild --release --target x86_64-unknown-linux-gnu -p trailway-agent`).
+
+Reaching a local API from a remote test box: `ssh -R 18080:127.0.0.1:18080 root@<host>`, then install with `--api http://127.0.0.1:18080` on the box. `TRAILWAY_MACHINE_ID` overrides the machine id when running the agent on a host without `/etc/machine-id` (macOS dev).
+
 ## Checks (same as CI)
 
 ```sh
