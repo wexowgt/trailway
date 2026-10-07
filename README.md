@@ -35,3 +35,12 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cd web && pnpm lint && pnpm build
 ```
+
+## Running a microVM (agent)
+
+On a Linux host with KVM: `sudo scripts/setup-host.sh`, then
+`trailway-agent vm run --image nginxdemos/hello --vcpus 1 --mem 256`,
+`trailway-agent vm status <id>`, `trailway-agent vm stop <id>`.
+Paths are overridable via `TRAILWAY_DATA_DIR`, `TRAILWAY_KERNEL`,
+`TRAILWAY_FIRECRACKER`, `TRAILWAY_BUSYBOX`. Rootfs images are cached per
+image digest under `$TRAILWAY_DATA_DIR/images/`.

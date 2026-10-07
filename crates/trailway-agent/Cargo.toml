@@ -7,3 +7,7 @@ publish.workspace = true
 
 [dependencies]
 trailway-proto.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
