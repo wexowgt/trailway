@@ -11,6 +11,22 @@ env:
 jobs:
   rust:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: trailway
+          POSTGRES_PASSWORD: trailway
+          POSTGRES_DB: trailway
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U trailway"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgres://trailway:trailway@localhost:5432/trailway
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
