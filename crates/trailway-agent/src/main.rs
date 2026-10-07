@@ -1,6 +1,7 @@
 use anyhow::{bail, Result};
 use clap::{Args, Parser, Subcommand};
-use trailway_agent::firecracker::{Config, FirecrackerRuntime};
+use std::io::{self, Read, Write};
+use trailway_agent::firecracker::{tail_lines, Config, FirecrackerRuntime};
 use trailway_agent::runtime::Runtime;
 use trailway_proto::VmSpec;
 
@@ -26,6 +27,16 @@ enum VmCommand {
     Status { id: String },
     /// Stop a microVM.
     Stop { id: String },
+    /// Print a microVM's console output (kernel and app stdout/stderr).
+    Logs {
+        id: String,
+        /// Keep streaming until the VM exits.
+        #[arg(short, long)]
+        follow: bool,
+        /// Only the last N lines of existing output.
+        #[arg(long)]
+        tail: Option<usize>,
+    },
 }
 
 #[derive(Args)]
@@ -37,6 +48,12 @@ struct RunArgs {
     /// Memory in MiB.
     #[arg(long = "mem", default_value_t = 256)]
     mem_mib: u32,
+    /// Port the app listens on inside the VM; a host port is forwarded to it.
+    #[arg(long)]
+    port: Option<u16>,
+    /// Host port to forward (random free port when omitted).
+    #[arg(long)]
+    host_port: Option<u16>,
     /// KEY=VALUE, repeatable.
     #[arg(long = "env", value_parser = parse_env)]
     env: Vec<(String, String)>,
@@ -65,13 +82,39 @@ fn main() -> Result<()> {
                 mem_mib: a.mem_mib,
                 env: a.env,
                 cmd: a.cmd,
+                port: a.port,
+                host_port: a.host_port,
             })?;
             println!("{id}");
+            if let Some(n) = rt.status(&id)?.network {
+                match n.host_port {
+                    Some(p) => {
+                        eprintln!("ip {} host port {p} -> {}", n.ip, n.app_port.unwrap_or(0))
+                    }
+                    None => eprintln!("ip {}", n.ip),
+                }
+            }
         }
         VmCommand::Status { id } => println!("{}", serde_json::to_string_pretty(&rt.status(&id)?)?),
         VmCommand::Stop { id } => {
             rt.stop(&id)?;
             println!("stopped {id}");
+        }
+        VmCommand::Logs { id, follow, tail } => {
+            let mut reader = rt.logs(&id, follow)?;
+            let mut out = io::stdout().lock();
+            match tail {
+                Some(n) => {
+                    let mut text = String::new();
+                    reader.read_to_string(&mut text)?;
+                    for line in tail_lines(&text, n) {
+                        writeln!(out, "{line}")?;
+                    }
+                }
+                None => {
+                    io::copy(&mut reader, &mut out)?;
+                }
+            }
         }
     }
     Ok(())

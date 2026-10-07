@@ -28,6 +28,7 @@ $B mount -t devpts devpts /dev/pts\n\
 $B mount -t tmpfs tmpfs /tmp\n\
 $B mount -t tmpfs tmpfs /run\n\
 $B mount -o ro /dev/vdb /mnt/cfg || {{ echo 'trailway: cannot mount config drive'; $B poweroff -f; }}\n\
+[ -f /mnt/cfg/net.sh ] && $B sh /mnt/cfg/net.sh\n\
 $B sh /mnt/cfg/run.sh\n\
 echo \"trailway: workload exited with $?\"\n\
 $B poweroff -f\n"
@@ -79,5 +80,6 @@ mod tests {
         assert!(s.starts_with("#!/.trailway/busybox sh"));
         assert!(s.contains("/dev/vdb"));
         assert!(s.contains("poweroff -f"));
+        assert!(s.contains("/mnt/cfg/net.sh"));
     }
 }
