@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use reqwest::StatusCode;
-use trailway_proto::{Heartbeat, RegisterRequest, RegisterResponse};
+use trailway_proto::{Heartbeat, RegisterRequest, RegisterResponse, UsageAck, UsageSample};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -73,6 +73,21 @@ impl ApiClient {
             s if s.is_success() => Ok(()),
             StatusCode::UNAUTHORIZED => Err(ClientError::Unauthorized),
             s => Err(ClientError::Other(anyhow::anyhow!("heartbeat failed: {s}"))),
+        }
+    }
+
+    pub async fn usage(&self, token: &str, sample: &UsageSample) -> Result<UsageAck, ClientError> {
+        let res = self
+            .http
+            .post(format!("{}/api/v1/agent/usage", self.api))
+            .bearer_auth(token)
+            .json(sample)
+            .send()
+            .await?;
+        match res.status() {
+            s if s.is_success() => Ok(res.json().await?),
+            StatusCode::UNAUTHORIZED => Err(ClientError::Unauthorized),
+            s => Err(ClientError::Other(anyhow::anyhow!("usage failed: {s}"))),
         }
     }
 }

@@ -1,6 +1,7 @@
 mod auth;
 mod crypto;
 mod error;
+mod ledger;
 mod server_keys;
 mod servers;
 
@@ -74,7 +75,11 @@ pub fn router(state: AppState) -> Router {
         .route("/server-keys/{id}", delete(server_keys::revoke))
         .route("/servers", get(servers::list))
         .route("/agent/register", post(servers::register))
-        .route("/agent/heartbeat", post(servers::heartbeat));
+        .route("/agent/heartbeat", post(servers::heartbeat))
+        .route("/agent/usage", post(ledger::ingest_usage))
+        .route("/servers/{id}/usage", get(ledger::server_usage))
+        .route("/ledger/balance", get(ledger::balance))
+        .route("/ledger/entries", get(ledger::entries));
     Router::new()
         .route("/healthz", get(healthz))
         .route("/install.sh", get(install_script))
