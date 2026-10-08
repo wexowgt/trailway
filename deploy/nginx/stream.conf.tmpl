@@ -1,0 +1,16 @@
+# Public :443 is split by TLS server name (no decryption): deployed services
+# under __SERVICE_SUFFIX__ go to the agent's Caddy, everything else (the
+# control plane and the other sites on this host) to nginx's normal vhosts.
+map $ssl_preread_server_name $tw_upstream {
+    __CONTROL_DOMAIN__  tw_nginx;
+    ~\.__SERVICE_SUFFIX_RE__$  tw_caddy;
+    default  tw_nginx;
+}
+upstream tw_nginx { server 127.0.0.1:4443; }
+upstream tw_caddy { server 127.0.0.1:8443; }
+server {
+    listen 443;
+    listen [::]:443;
+    ssl_preread on;
+    proxy_pass $tw_upstream;
+}
