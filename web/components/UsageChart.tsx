@@ -82,7 +82,7 @@ export function UsageChart({ title, unit, series, range, from, to, value, limit,
                 tick={{ fontSize: 11 }}
                 tickLine={false}
                 axisLine={false}
-                width={76}
+                width={92}
               />
               <Tooltip
                 contentStyle={{ background: "#13131d", border: `1px solid ${GRID}`, borderRadius: 8 }}
