@@ -13,6 +13,8 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
 pub const DEFAULT_ADMIN: &str = "127.0.0.1:2019";
+/// Where the Caddy HTTP server listens when nothing else is configured.
+pub const DEFAULT_LISTEN: &str = ":443";
 /// Name of the one Caddy HTTP server the agent owns.
 const SERVER: &str = "trailway";
 /// Prefix of the `@id` of every route the agent owns; others are left alone.
@@ -86,18 +88,40 @@ fn parse_route(v: &Value) -> Option<Route> {
 
 pub struct CaddyProxy {
     admin: String,
+    listen: String,
+}
+
+/// The Caddy HTTP server the agent owns. On a non-default listen address
+/// something else (nginx forwarding by SNI) sits in front on the public ports,
+/// so Caddy must not redirect to its own port.
+fn server_config(listen: &str) -> Value {
+    let mut server = json!({"listen": [listen], "routes": []});
+    if listen != DEFAULT_LISTEN {
+        server["automatic_https"] = json!({"disable_redirects": true});
+    }
+    server
 }
 
 impl CaddyProxy {
     pub fn new(admin: impl Into<String>) -> Self {
         Self {
             admin: admin.into(),
+            listen: DEFAULT_LISTEN.into(),
         }
     }
 
-    /// `TRAILWAY_CADDY_ADMIN` overrides the admin address.
+    pub fn with_listen(mut self, listen: impl Into<String>) -> Self {
+        self.listen = listen.into();
+        self
+    }
+
+    /// `TRAILWAY_CADDY_ADMIN` overrides the admin address and
+    /// `TRAILWAY_CADDY_LISTEN` the address the HTTPS server listens on.
     pub fn from_env() -> Self {
         Self::new(std::env::var("TRAILWAY_CADDY_ADMIN").unwrap_or_else(|_| DEFAULT_ADMIN.into()))
+            .with_listen(
+                std::env::var("TRAILWAY_CADDY_LISTEN").unwrap_or_else(|_| DEFAULT_LISTEN.into()),
+            )
     }
 
     fn request(&self, method: &str, path: &str, body: Option<&Value>) -> Result<(u16, Vec<u8>)> {
@@ -147,10 +171,7 @@ impl CaddyProxy {
             return Ok(false);
         }
         // Host matchers make Caddy get certificates and redirect HTTP to HTTPS on its own.
-        let config = json!({"apps": {"http": {"servers": {SERVER: {
-            "listen": [":443"],
-            "routes": [],
-        }}}}});
+        let config = json!({"apps": {"http": {"servers": {SERVER: server_config(&self.listen)}}}});
         self.json("POST", "/load", Some(&config))?;
         Ok(true)
     }
@@ -259,6 +280,16 @@ mod tests {
             domain: domain.into(),
             port,
         }
+    }
+
+    #[test]
+    fn server_listens_where_told() {
+        let default = server_config(DEFAULT_LISTEN);
+        assert_eq!(default["listen"][0], ":443");
+        assert!(default.get("automatic_https").is_none());
+        let behind_proxy = server_config("127.0.0.1:8443");
+        assert_eq!(behind_proxy["listen"][0], "127.0.0.1:8443");
+        assert_eq!(behind_proxy["automatic_https"]["disable_redirects"], true);
     }
 
     #[test]

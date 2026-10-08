@@ -1,0 +1,6 @@
+# Caddy only runs the agent's service routes (managed through the admin API).
+# It binds no ports until the agent creates its server; on a host where nginx
+# owns 80 and 443 the agent listens on 127.0.0.1:8443 (TRAILWAY_CADDY_LISTEN).
+{
+	admin 127.0.0.1:2019
+}

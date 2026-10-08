@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Prepares a host to run the Trailway control plane (Postgres, API, web) with
-# docker-compose.prod.yml behind the host Caddy. Safe to re-run. Run as root
-# after scripts/setup-host.sh (which installs Caddy).
+# docker-compose.prod.yml. The web front is set up by setup-nginx-front.sh.
+# Safe to re-run. Run as root after scripts/setup-host.sh.
 #   CONTROL_DOMAIN=trailway.178-104-208-91.sslip.io ./setup-control-plane.sh
 set -euo pipefail
 
@@ -34,10 +34,4 @@ cat > /etc/cron.d/trailway-backup <<CRON
 15 3 * * * root COMPOSE_DIR=$APP_DIR /usr/local/bin/trailway-backup >> /var/log/trailway-backup.log 2>&1
 CRON
 
-# Caddy: control plane site plus the agent's server (see Caddyfile.tmpl).
-sed "s/__DOMAIN__/$CONTROL_DOMAIN/" "$DEPLOY_DIR/Caddyfile.tmpl" > /etc/caddy/Caddyfile.new
-caddy validate --config /etc/caddy/Caddyfile.new --adapter caddyfile
-chmod 644 /etc/caddy/Caddyfile.new
-mv /etc/caddy/Caddyfile.new /etc/caddy/Caddyfile
-systemctl reload caddy || systemctl restart caddy
-echo "control plane host ready: $APP_DIR (.env), https://$CONTROL_DOMAIN"
+echo "control plane host ready: $APP_DIR (.env). Next: scripts/setup-nginx-front.sh (nginx owns 80/443 here), then deploy."

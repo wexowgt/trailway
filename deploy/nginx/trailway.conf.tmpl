@@ -1,0 +1,46 @@
+# Trailway control plane. TLS is terminated here (certbot certificate) for
+# __CONTROL_DOMAIN__; the public :443 reaches this server through the stream
+# split on 127.0.0.1:4443.
+map $http_upgrade $tw_connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name __CONTROL_DOMAIN__;
+    location /.well-known/acme-challenge/ { root /var/www/letsencrypt; }
+    location / { return 301 https://$host$request_uri; }
+}
+
+# Deployed services get certificates from Caddy (TLS-ALPN through the stream
+# split); plain HTTP just redirects.
+server {
+    listen 80;
+    listen [::]:80;
+    server_name *.__SERVICE_SUFFIX__;
+    location / { return 301 https://$host$request_uri; }
+}
+
+server {
+    listen 127.0.0.1:4443 ssl;
+    server_name __CONTROL_DOMAIN__;
+    ssl_certificate /etc/letsencrypt/live/__CONTROL_DOMAIN__/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/__CONTROL_DOMAIN__/privkey.pem;
+
+    client_max_body_size 50m;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $tw_connection_upgrade;
+    proxy_read_timeout 1h;
+
+    location ~ ^/(api/|install\.sh$|downloads/) {
+        proxy_pass http://127.0.0.1:8080;
+    }
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+    }
+}
