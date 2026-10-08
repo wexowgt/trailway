@@ -6,7 +6,7 @@ use crate::runtime::{validate_spec, Runtime};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -167,6 +167,19 @@ impl Runtime for FirecrackerRuntime {
             _ => VmState::Stopped,
         };
         Ok(info)
+    }
+
+    fn prepare(&self, spec: &VmSpec) -> Result<()> {
+        validate_spec(spec)?;
+        self.images.ensure(&spec.image).map(|_| ())
+    }
+
+    fn logs_from(&self, id: &str, offset: u64) -> Result<Box<dyn Read + Send>> {
+        self.read_info(id)?;
+        let mut file = File::open(self.vm_dir(id).join("console.log"))
+            .with_context(|| format!("no console log for {id}"))?;
+        file.seek(SeekFrom::Start(offset))?;
+        Ok(Box::new(file))
     }
 
     fn logs(&self, id: &str, follow: bool) -> Result<Box<dyn Read + Send>> {

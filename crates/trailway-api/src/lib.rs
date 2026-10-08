@@ -1,8 +1,13 @@
+mod agent_ws;
 mod auth;
 mod crypto;
+mod deployments;
 mod error;
+mod hub;
+mod projects;
 mod server_keys;
 mod servers;
+mod services;
 
 use std::path::PathBuf;
 
@@ -59,6 +64,18 @@ impl Config {
 pub struct AppState {
     pub pool: PgPool,
     pub config: Config,
+    /// Live agent connections, by server.
+    pub hub: hub::Hub,
+}
+
+impl AppState {
+    pub fn new(pool: PgPool, config: Config) -> Self {
+        Self {
+            pool,
+            config,
+            hub: hub::Hub::default(),
+        }
+    }
 }
 
 pub fn router(state: AppState) -> Router {
@@ -74,7 +91,40 @@ pub fn router(state: AppState) -> Router {
         .route("/server-keys/{id}", delete(server_keys::revoke))
         .route("/servers", get(servers::list))
         .route("/agent/register", post(servers::register))
-        .route("/agent/heartbeat", post(servers::heartbeat));
+        .route("/agent/heartbeat", post(servers::heartbeat))
+        .route("/agent/ws", get(agent_ws::connect))
+        .route("/projects", post(projects::create).get(projects::list))
+        .route(
+            "/projects/{id}",
+            get(projects::get)
+                .patch(projects::rename)
+                .delete(projects::delete),
+        )
+        .route(
+            "/projects/{id}/environments",
+            post(projects::create_environment).get(projects::list_environments),
+        )
+        .route(
+            "/environments/{id}",
+            get(projects::get_environment)
+                .patch(projects::rename_environment)
+                .delete(projects::delete_environment),
+        )
+        .route(
+            "/environments/{id}/services",
+            post(services::create).get(services::list),
+        )
+        .route(
+            "/services/{id}",
+            get(services::get)
+                .patch(services::update)
+                .delete(services::delete),
+        )
+        .route("/services/{id}/deploy", post(deployments::deploy))
+        .route("/services/{id}/stop", post(deployments::stop))
+        .route("/services/{id}/deployments", get(deployments::list))
+        .route("/deployments/{id}", get(deployments::get))
+        .route("/deployments/{id}/logs", get(deployments::logs));
     Router::new()
         .route("/healthz", get(healthz))
         .route("/install.sh", get(install_script))
@@ -131,10 +181,7 @@ mod tests {
         let pool = PgPoolOptions::new()
             .connect_lazy("postgres://localhost/unused")
             .unwrap();
-        let state = AppState {
-            pool,
-            config: Config::default(),
-        };
+        let state = AppState::new(pool, Config::default());
         let res = router(state)
             .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
             .await

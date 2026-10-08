@@ -2,9 +2,9 @@
 
 use anyhow::{bail, Result};
 use std::collections::BTreeMap;
-use std::io::{Cursor, Read};
+use std::io::{self, Cursor, Read};
 use std::sync::Mutex;
-use trailway_proto::{VmInfo, VmSpec, VmState};
+use trailway_proto::{VmInfo, VmNetwork, VmSpec, VmState};
 
 pub const MIN_MEM_MIB: u32 = 64;
 pub const MAX_VCPUS: u8 = 32;
@@ -18,6 +18,20 @@ pub trait Runtime {
     /// The VM's console output (kernel and app stdout/stderr). With `follow`
     /// the reader blocks for new output until the VM exits.
     fn logs(&self, id: &str, follow: bool) -> Result<Box<dyn Read + Send>>;
+
+    /// Gets everything `start` needs that can be done ahead of time (pulling
+    /// and unpacking the image), so a deploy can report "building" apart from
+    /// "deploying". Does nothing by default.
+    fn prepare(&self, _spec: &VmSpec) -> Result<()> {
+        Ok(())
+    }
+
+    /// The console output from byte `offset` on, without following.
+    fn logs_from(&self, id: &str, offset: u64) -> Result<Box<dyn Read + Send>> {
+        let mut reader = self.logs(id, false)?;
+        io::copy(&mut reader.by_ref().take(offset), &mut io::sink())?;
+        Ok(reader)
+    }
 }
 
 /// Rejects specs no runtime can honour.
@@ -47,17 +61,29 @@ pub fn validate_spec(spec: &VmSpec) -> Result<()> {
     Ok(())
 }
 
-/// In-memory runtime for tests.
+/// Images with this prefix fail to prepare in the [`FakeRuntime`].
+pub const FAIL_IMAGE_PREFIX: &str = "fail/";
+
+/// In-memory runtime for tests (and `TRAILWAY_FAKE_RUNTIME=1` on hosts without KVM).
 #[derive(Default)]
 pub struct FakeRuntime {
     vms: Mutex<BTreeMap<String, VmInfo>>,
 }
 
 impl Runtime for FakeRuntime {
-    fn start(&self, spec: &VmSpec) -> Result<String> {
+    fn prepare(&self, spec: &VmSpec) -> Result<()> {
         validate_spec(spec)?;
+        if spec.image.starts_with(FAIL_IMAGE_PREFIX) {
+            bail!("pull access denied for {}", spec.image);
+        }
+        Ok(())
+    }
+
+    fn start(&self, spec: &VmSpec) -> Result<String> {
+        self.prepare(spec)?;
         let mut vms = self.vms.lock().unwrap();
         let id = format!("fake-{}", vms.len() + 1);
+        let n = vms.len() as u16;
         vms.insert(
             id.clone(),
             VmInfo {
@@ -65,7 +91,13 @@ impl Runtime for FakeRuntime {
                 spec: spec.clone(),
                 state: VmState::Running,
                 image_digest: "sha256:fake".into(),
-                network: None,
+                network: spec.port.map(|app_port| VmNetwork {
+                    ip: format!("10.200.0.{}", n + 2),
+                    mac: "AA:FC:00:00:00:00".into(),
+                    tap: format!("tap-{id}"),
+                    host_port: Some(spec.host_port.unwrap_or(30000 + n)),
+                    app_port: Some(app_port),
+                }),
             },
         );
         Ok(id)

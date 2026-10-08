@@ -13,6 +13,8 @@ pub enum ApiError {
     Unauthorized,
     NotFound,
     Conflict(String),
+    /// A refusal with its own machine-readable code, e.g. `insufficient_capacity`.
+    Refused(&'static str, String),
     Internal,
 }
 
@@ -34,6 +36,16 @@ impl From<sqlx::Error> for ApiError {
     }
 }
 
+/// Maps a unique-constraint violation to a 409 with `message`.
+pub fn conflict_on_unique(err: sqlx::Error, message: &str) -> ApiError {
+    match &err {
+        sqlx::Error::Database(db) if db.is_unique_violation() => {
+            ApiError::Conflict(message.to_string())
+        }
+        _ => err.into(),
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, code, message) = match self {
@@ -45,6 +57,7 @@ impl IntoResponse for ApiError {
             ),
             Self::NotFound => (StatusCode::NOT_FOUND, "not_found", "Not found".to_string()),
             Self::Conflict(m) => (StatusCode::CONFLICT, "conflict", m),
+            Self::Refused(code, m) => (StatusCode::CONFLICT, code, m),
             Self::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",

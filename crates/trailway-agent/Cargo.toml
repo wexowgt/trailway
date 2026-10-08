@@ -17,3 +17,5 @@ tracing-subscriber.workspace = true
 reqwest.workspace = true
 sysinfo.workspace = true
 uuid.workspace = true
+futures-util.workspace = true
+tokio-tungstenite.workspace = true

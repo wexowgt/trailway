@@ -1,5 +1,7 @@
 //! Shared wire types for API <-> agent messages.
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -196,6 +198,201 @@ impl std::fmt::Debug for CreatedServerKey {
     }
 }
 
+/// Lifecycle of a deployment, as stored by the API and reported by the agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeploymentStatus {
+    Queued,
+    Building,
+    Deploying,
+    Running,
+    Failed,
+    Stopped,
+}
+
+impl DeploymentStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Building => "building",
+            Self::Deploying => "deploying",
+            Self::Running => "running",
+            Self::Failed => "failed",
+            Self::Stopped => "stopped",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "queued" => Self::Queued,
+            "building" => Self::Building,
+            "deploying" => Self::Deploying,
+            "running" => Self::Running,
+            "failed" => Self::Failed,
+            "stopped" => Self::Stopped,
+            _ => return None,
+        })
+    }
+
+    /// No further status changes are expected without a new job.
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Failed | Self::Stopped)
+    }
+}
+
+/// CPU a vCPU reserves on a server, in the millicores the heartbeat uses.
+pub const MILLICORES_PER_VCPU: u64 = 1000;
+
+/// Path of the agent WebSocket (`GET`, `Authorization: Bearer tw_st_...`).
+pub const AGENT_WS_PATH: &str = "/api/v1/agent/ws";
+
+/// A deploy job: run `spec` for `service_id`, replacing the VM that service
+/// currently has on this server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeployJob {
+    pub deployment_id: Uuid,
+    pub service_id: Uuid,
+    pub spec: VmSpec,
+}
+
+/// Messages from the API to the agent over the WebSocket.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ApiMessage {
+    Deploy(DeployJob),
+    /// Stop and forget a deployment's VM.
+    Stop {
+        deployment_id: Uuid,
+    },
+}
+
+/// What the agent knows about one deployment (sent on connect and on change).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeploymentReport {
+    pub deployment_id: Uuid,
+    pub status: DeploymentStatus,
+    #[serde(default)]
+    pub vm_id: Option<String>,
+    #[serde(default)]
+    pub host_port: Option<u16>,
+    /// Why a deployment failed.
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// Messages from the agent to the API over the WebSocket.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentMessage {
+    /// First message after connecting: the actual state of every deployment
+    /// the agent still knows about.
+    Hello {
+        deployments: Vec<DeploymentReport>,
+    },
+    Status(DeploymentReport),
+    /// Console output of a deployment. `offset` is the byte position of the
+    /// chunk in the VM's console log and `len` its raw size, so the API can
+    /// drop chunks it already has after a reconnect.
+    Logs {
+        deployment_id: Uuid,
+        offset: u64,
+        len: u64,
+        text: String,
+    },
+}
+
+/// Body of `POST /api/v1/projects` and `POST /api/v1/projects/{id}/environments`,
+/// and of the matching `PATCH`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NameBody {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Project {
+    pub id: Uuid,
+    pub name: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Environment {
+    pub id: Uuid,
+    pub project_id: Uuid,
+    pub name: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Body of `POST /api/v1/environments/{id}/services`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateService {
+    pub name: String,
+    /// OCI image reference, e.g. `nginxdemos/hello`.
+    pub image: String,
+    #[serde(default)]
+    pub vcpus: Option<u8>,
+    #[serde(default)]
+    pub memory_mib: Option<u32>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// Port the app listens on; a host port of the server is forwarded to it.
+    #[serde(default)]
+    pub port: Option<u16>,
+    /// Target server; must belong to the caller.
+    pub server_id: Uuid,
+}
+
+/// Body of `PATCH /api/v1/services/{id}`. Unset fields stay as they are; a
+/// change only applies to the next deploy.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateService {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub image: Option<String>,
+    #[serde(default)]
+    pub vcpus: Option<u8>,
+    #[serde(default)]
+    pub memory_mib: Option<u32>,
+    #[serde(default)]
+    pub env: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub server_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Service {
+    pub id: Uuid,
+    pub environment_id: Uuid,
+    pub name: String,
+    pub image: String,
+    pub vcpus: u8,
+    pub memory_mib: u32,
+    pub env: BTreeMap<String, String>,
+    pub port: Option<u16>,
+    pub server_id: Uuid,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Deployment {
+    pub id: Uuid,
+    pub service_id: Option<Uuid>,
+    pub server_id: Uuid,
+    pub status: DeploymentStatus,
+    pub image: String,
+    pub vcpus: u8,
+    pub memory_mib: u32,
+    /// Port on the server that forwards to the app port, once running.
+    pub host_port: Option<u16>,
+    pub error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// Error envelope used by every non-2xx API response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorEnvelope {
@@ -243,6 +440,36 @@ mod tests {
             token: "tw_st_secret".into(),
         };
         assert!(!format!("{r:?}").contains("secret"));
+    }
+
+    #[test]
+    fn messages_are_tagged() {
+        let m = AgentMessage::Status(DeploymentReport {
+            deployment_id: Uuid::nil(),
+            status: DeploymentStatus::Running,
+            vm_id: Some("vm".into()),
+            host_port: Some(20000),
+            error: None,
+        });
+        let json = serde_json::to_value(&m).unwrap();
+        assert_eq!(json["type"], "status");
+        assert_eq!(json["status"], "running");
+        assert_eq!(serde_json::from_value::<AgentMessage>(json).unwrap(), m);
+    }
+
+    #[test]
+    fn deployment_status_strings_roundtrip() {
+        for s in [
+            DeploymentStatus::Queued,
+            DeploymentStatus::Building,
+            DeploymentStatus::Deploying,
+            DeploymentStatus::Running,
+            DeploymentStatus::Failed,
+            DeploymentStatus::Stopped,
+        ] {
+            assert_eq!(DeploymentStatus::parse(s.as_str()), Some(s));
+        }
+        assert!(DeploymentStatus::parse("nope").is_none());
     }
 
     #[test]
