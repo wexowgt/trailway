@@ -9,6 +9,13 @@ use trailway_proto::{VmInfo, VmNetwork, VmSpec, VmState};
 pub const MIN_MEM_MIB: u32 = 64;
 pub const MAX_VCPUS: u8 = 32;
 
+/// What a VM has used so far: CPU time is cumulative, memory is current.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VmStats {
+    pub cpu_micros: u64,
+    pub memory_bytes: u64,
+}
+
 /// Starts, stops and inspects workloads. `FirecrackerRuntime` is the real
 /// implementation; `FakeRuntime` lets tests run without KVM.
 pub trait Runtime {
@@ -18,6 +25,11 @@ pub trait Runtime {
     /// The VM's console output (kernel and app stdout/stderr). With `follow`
     /// the reader blocks for new output until the VM exits.
     fn logs(&self, id: &str, follow: bool) -> Result<Box<dyn Read + Send>>;
+
+    /// CPU time used and memory held by the VM. Unsupported by default.
+    fn stats(&self, id: &str) -> Result<VmStats> {
+        bail!("no stats for {id}")
+    }
 
     /// Gets everything `start` needs that can be done ahead of time (pulling
     /// and unpacking the image), so a deploy can report "building" apart from
@@ -68,6 +80,7 @@ pub const FAIL_IMAGE_PREFIX: &str = "fail/";
 #[derive(Default)]
 pub struct FakeRuntime {
     vms: Mutex<BTreeMap<String, VmInfo>>,
+    started: Mutex<BTreeMap<String, std::time::Instant>>,
 }
 
 impl Runtime for FakeRuntime {
@@ -83,6 +96,10 @@ impl Runtime for FakeRuntime {
         self.prepare(spec)?;
         let mut vms = self.vms.lock().unwrap();
         let id = format!("fake-{}", vms.len() + 1);
+        self.started
+            .lock()
+            .unwrap()
+            .insert(id.clone(), std::time::Instant::now());
         let n = vms.len() as u16;
         vms.insert(
             id.clone(),
@@ -118,6 +135,18 @@ impl Runtime for FakeRuntime {
             Some(vm) => Ok(vm.clone()),
             None => bail!("unknown vm {id}"),
         }
+    }
+
+    /// A VM that works at 20 to 40 % of a vCPU and slowly grows its memory.
+    fn stats(&self, id: &str) -> Result<VmStats> {
+        self.status(id)?;
+        let started = self.started.lock().unwrap()[id];
+        let secs = started.elapsed().as_secs_f64();
+        let busy = 0.3 + 0.1 * (secs / 7.0).sin();
+        Ok(VmStats {
+            cpu_micros: (secs * busy * 1e6) as u64,
+            memory_bytes: 96 * 1024 * 1024 + (secs * 64.0 * 1024.0) as u64,
+        })
     }
 
     fn logs(&self, id: &str, _follow: bool) -> Result<Box<dyn Read + Send>> {

@@ -6,6 +6,7 @@ mod domains;
 mod error;
 mod hub;
 mod ledger;
+mod observability;
 mod projects;
 mod server_keys;
 mod servers;
@@ -24,6 +25,7 @@ use sqlx::PgPool;
 use trailway_proto::Health;
 
 pub use error::ApiError;
+pub use observability::prune_metrics;
 
 const DEFAULT_SESSION_TTL_SECS: i64 = 30 * 24 * 60 * 60;
 
@@ -147,7 +149,16 @@ pub fn router(state: AppState) -> Router {
         .route("/agent/usage", post(ledger::ingest_usage))
         .route("/servers/{id}/usage", get(ledger::server_usage))
         .route("/ledger/balance", get(ledger::balance))
-        .route("/ledger/entries", get(ledger::entries));
+        .route("/ledger/entries", get(ledger::entries))
+        .route("/ledger/servers", get(observability::ledger_servers))
+        .route(
+            "/environments/{id}/metrics",
+            get(observability::environment_metrics),
+        )
+        .route(
+            "/environments/{id}/logs",
+            get(observability::environment_logs),
+        );
     Router::new()
         .route("/healthz", get(healthz))
         .route("/install.sh", get(install_script))

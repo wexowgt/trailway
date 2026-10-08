@@ -79,6 +79,9 @@ async fn handle(state: &AppState, server_id: Uuid, msg: AgentMessage) -> Result<
             len,
             text,
         } => store_logs(&state.pool, server_id, deployment_id, offset, len, &text).await,
+        AgentMessage::Metrics { samples } => {
+            crate::observability::store_metrics(&state.pool, server_id, &samples).await
+        }
     }
 }
 

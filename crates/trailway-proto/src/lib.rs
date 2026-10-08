@@ -450,6 +450,75 @@ pub enum AgentMessage {
         len: u64,
         text: String,
     },
+    /// Current CPU and memory use of the running VMs, sent every few seconds.
+    Metrics {
+        samples: Vec<VmMetric>,
+    },
+}
+
+/// Resource use of one deployment's microVM right now. CPU is millicores
+/// (1000 = one vCPU fully busy), memory is the resident bytes of the VM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VmMetric {
+    pub deployment_id: Uuid,
+    pub cpu_millicores: u64,
+    pub memory_bytes: u64,
+}
+
+/// One point of a service's CPU and memory series (mean over its bucket).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MetricPoint {
+    pub ts: DateTime<Utc>,
+    pub cpu_millicores: f64,
+    pub memory_bytes: f64,
+}
+
+/// A service's series plus the limits it is configured with (the dotted line).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServiceSeries {
+    pub service_id: Uuid,
+    pub name: String,
+    pub cpu_limit_millicores: u64,
+    pub memory_limit_bytes: u64,
+    pub points: Vec<MetricPoint>,
+}
+
+/// Response of `GET /api/v1/environments/{id}/metrics`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EnvironmentMetrics {
+    pub from: DateTime<Utc>,
+    pub to: DateTime<Utc>,
+    pub bucket_secs: i64,
+    pub services: Vec<ServiceSeries>,
+}
+
+/// One chunk of console output of a service (one or more lines).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogChunk {
+    /// Position in the log store, used as the `after` cursor.
+    pub id: i64,
+    pub ts: DateTime<Utc>,
+    pub service_id: Uuid,
+    pub service: String,
+    pub text: String,
+}
+
+/// Response of `GET /api/v1/environments/{id}/logs`, oldest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvironmentLogs {
+    pub chunks: Vec<LogChunk>,
+    /// Pass as `after` to get what came since.
+    pub next_after: i64,
+}
+
+/// What one of the caller's servers contributed (and consumed), in ledger units.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServerLedger {
+    pub server_id: Uuid,
+    pub hostname: Option<String>,
+    pub contributed: Compute,
+    pub consumed: Compute,
+    pub balance: Compute,
 }
 
 /// Body of `POST /api/v1/projects` and `POST /api/v1/projects/{id}/environments`,

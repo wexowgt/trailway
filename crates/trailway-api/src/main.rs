@@ -25,6 +25,16 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     tracing::info!("trailway-api listening on {bind_addr}");
+    let prune_pool = pool.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3600));
+        loop {
+            ticker.tick().await;
+            if let Err(e) = trailway_api::prune_metrics(&prune_pool).await {
+                tracing::warn!("could not prune old metrics: {e}");
+            }
+        }
+    });
     let state = trailway_api::AppState::new(pool, trailway_api::Config::from_env()?);
     axum::serve(listener, trailway_api::router(state)).await?;
     Ok(())

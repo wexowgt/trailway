@@ -165,7 +165,7 @@ pub async fn ingest_usage(
     }))
 }
 
-fn compute(millicore_seconds: f64, byte_seconds: f64) -> Compute {
+pub(crate) fn compute(millicore_seconds: f64, byte_seconds: f64) -> Compute {
     Compute {
         vcpu_seconds: millicore_seconds / 1000.0,
         gb_seconds: byte_seconds / BYTES_PER_GB,
