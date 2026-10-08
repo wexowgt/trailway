@@ -2,6 +2,7 @@ mod client;
 mod config;
 mod daemon;
 mod host;
+mod usage;
 
 use std::path::PathBuf;
 
