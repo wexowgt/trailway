@@ -85,6 +85,7 @@ mod tests {
             },
             disk: Resource::default(),
             kvm,
+            public_ip: None,
         }
     }
 

@@ -55,6 +55,39 @@ else
 fi
 install -m 0755 "$TMP" "$BIN"
 
+# Caddy terminates HTTPS (Let's Encrypt) for service URLs; the agent adds and
+# removes routes through its admin API on 127.0.0.1:2019.
+install_caddy() {
+  if ! command -v caddy >/dev/null 2>&1; then
+    if ! command -v apt-get >/dev/null 2>&1; then
+      echo "WARNING: not a Debian/Ubuntu host, install Caddy yourself for public service URLs." >&2
+      return 0
+    fi
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y -qq debian-keyring debian-archive-keyring apt-transport-https curl gpg
+    curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --batch --yes --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+    curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt -o /etc/apt/sources.list.d/caddy-stable.list
+    apt-get update -qq
+    apt-get install -y -qq caddy
+  fi
+  mkdir -p /etc/caddy
+  # Routes are not in a file: the agent creates the HTTP server at runtime.
+  printf '{\n\tadmin 127.0.0.1:2019\n}\n' > /etc/caddy/Caddyfile.trailway
+  if ! cmp -s /etc/caddy/Caddyfile.trailway /etc/caddy/Caddyfile || ! systemctl is-active --quiet caddy; then
+    mv /etc/caddy/Caddyfile.trailway /etc/caddy/Caddyfile
+    systemctl enable caddy >/dev/null 2>&1 || true
+    systemctl restart caddy
+  fi
+  rm -f /etc/caddy/Caddyfile.trailway
+  if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
+    ufw allow 80/tcp >/dev/null
+    ufw allow 443/tcp >/dev/null
+  fi
+}
+
+install_caddy
+
 mkdir -p "$CONF_DIR"
 chmod 0700 "$CONF_DIR"
 umask 077

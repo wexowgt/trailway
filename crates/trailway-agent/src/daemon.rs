@@ -5,8 +5,9 @@ use std::{
 };
 
 use trailway_agent::{
-    deploy::{Manager, SharedRuntime},
+    deploy::{Manager, SharedProxy, SharedRuntime},
     firecracker::{Config as FcConfig, FirecrackerRuntime},
+    proxy::{CaddyProxy, NoProxy},
     runtime::FakeRuntime,
     session::{self, SessionError},
 };
@@ -23,6 +24,8 @@ use crate::{
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 /// One usage sample is sent per this many seconds, aggregated from heartbeats.
 const USAGE_INTERVAL_SECS: i64 = 60;
+/// How long to wait before looking for the public IP again.
+const PUBLIC_IP_RETRY: Duration = Duration::from_secs(60);
 const RETRY_DELAY: Duration = Duration::from_secs(5);
 const MIN_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
@@ -84,9 +87,24 @@ async fn heartbeats(shared: Arc<Shared>) {
     let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut window = UsageWindow::new(Utc::now());
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap_or_default();
+    let mut public_ip: Option<String> = None;
+    let mut ip_checked: Option<tokio::time::Instant> = None;
     loop {
         ticker.tick().await;
-        let hb = sampler.heartbeat();
+        // Public URLs depend on it: look again (not every beat) until it is known.
+        if public_ip.is_none() && ip_checked.is_none_or(|t| t.elapsed() >= PUBLIC_IP_RETRY) {
+            ip_checked = Some(tokio::time::Instant::now());
+            public_ip = host::public_ip(&http).await;
+            if public_ip.is_none() {
+                tracing::warn!("could not find this host's public IP; set TRAILWAY_PUBLIC_IP");
+            }
+        }
+        let mut hb = sampler.heartbeat();
+        hb.public_ip = public_ip.clone();
         window.push(&hb);
         let token = shared.token().await;
         match shared.client.heartbeat(&token, &hb).await {
@@ -148,6 +166,15 @@ fn runtime() -> SharedRuntime {
     Arc::new(FirecrackerRuntime::new(FcConfig::from_env()))
 }
 
+/// Public routes go through the Caddy this host runs. `TRAILWAY_PROXY=off`
+/// turns them off (development without Caddy).
+fn proxy() -> SharedProxy {
+    if std::env::var("TRAILWAY_PROXY").is_ok_and(|v| v == "off") {
+        return Arc::new(NoProxy);
+    }
+    Arc::new(CaddyProxy::from_env())
+}
+
 async fn run_loop(config_path: &Path, state_path: &Path) -> anyhow::Result<()> {
     let config = Config::load(config_path)?;
     let client = ApiClient::new(&config.api)?;
@@ -156,7 +183,7 @@ async fn run_loop(config_path: &Path, state_path: &Path) -> anyhow::Result<()> {
         None => register(&client, &config, state_path).await,
     };
     let record = state_path.with_file_name("deployments.json");
-    let manager = Manager::new(runtime(), Some(record));
+    let manager = Manager::new(runtime(), proxy(), Some(record));
     let shared = Arc::new(Shared {
         client,
         config,

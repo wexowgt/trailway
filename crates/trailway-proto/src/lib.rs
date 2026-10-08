@@ -57,6 +57,10 @@ pub struct Heartbeat {
     pub disk: Resource,
     /// `/dev/kvm` is available, so microVMs can run on this host.
     pub kvm: bool,
+    /// Public IPv4 address of the host, once the agent knows it. Services get
+    /// their public URL from it.
+    #[serde(default)]
+    pub public_ip: Option<String>,
 }
 
 /// Whether a server is currently sending heartbeats.
@@ -347,6 +351,9 @@ pub struct DeployJob {
     pub deployment_id: Uuid,
     pub service_id: Uuid,
     pub spec: VmSpec,
+    /// Public host name to route to the VM's forwarded port over HTTPS.
+    #[serde(default)]
+    pub domain: Option<String>,
 }
 
 /// Messages from the API to the agent over the WebSocket.
@@ -467,6 +474,10 @@ pub struct Service {
     pub env: BTreeMap<String, String>,
     pub port: Option<u16>,
     pub server_id: Uuid,
+    /// Public HTTPS URL of the service (needs `port` and a server whose public
+    /// IP is known). It stays the same across deploys.
+    #[serde(default)]
+    pub url: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -514,6 +525,7 @@ mod tests {
             memory: Resource::default(),
             disk: Resource::default(),
             kvm: true,
+            public_ip: Some("178.104.208.91".into()),
         };
         let json = serde_json::to_string(&hb).unwrap();
         assert_eq!(serde_json::from_str::<Heartbeat>(&json).unwrap(), hb);

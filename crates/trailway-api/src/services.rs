@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::{
     auth::AuthUser,
-    deployments,
+    deployments, domains,
     error::{conflict_on_unique, ApiError, ApiJson},
     projects::require_environment,
     servers::check_text,
@@ -40,8 +40,23 @@ pub struct ServiceRow {
     pub env: Jsonb<BTreeMap<String, String>>,
     pub port: Option<i32>,
     pub server_id: Uuid,
+    pub host_label: String,
+    pub public_ip: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+impl ServiceRow {
+    /// The public host name, once the service has a port and the server's IP is known.
+    pub fn domain(&self, domain_base: &str) -> Option<String> {
+        self.port?;
+        domains::domain(&self.host_label, domain_base, self.public_ip.as_deref())
+    }
+
+    pub fn into_service(self, domain_base: &str) -> Service {
+        let url = self.domain(domain_base).map(|d| format!("https://{d}"));
+        Service { url, ..self.into() }
+    }
 }
 
 impl From<ServiceRow> for Service {
@@ -56,6 +71,7 @@ impl From<ServiceRow> for Service {
             env: r.env.0,
             port: r.port.map(|p| p as u16),
             server_id: r.server_id,
+            url: None,
             created_at: r.created_at,
             updated_at: r.updated_at,
         }
@@ -63,7 +79,9 @@ impl From<ServiceRow> for Service {
 }
 
 const COLS: &str = "s.id, s.environment_id, s.name, s.image, s.vcpus, s.memory_mib, s.env, \
-                    s.port, s.server_id, s.created_at, s.updated_at";
+                    s.port, s.server_id, s.host_label, \
+                    (SELECT public_ip FROM servers WHERE id = s.server_id) AS public_ip, \
+                    s.created_at, s.updated_at";
 
 /// Loads a service the user owns (through its environment and project).
 pub async fn owned_service(pool: &PgPool, user: Uuid, id: Uuid) -> Result<ServiceRow, ApiError> {
@@ -148,6 +166,27 @@ async fn check_server(pool: &PgPool, user: Uuid, server_id: Uuid) -> Result<(), 
         .ok_or_else(|| ApiError::validation("server_id is not one of your servers"))
 }
 
+/// The label a service gets on a server: `<service>-<environment>`, made
+/// unique among the server's services.
+async fn free_label(
+    pool: &PgPool,
+    server_id: Uuid,
+    service_id: Uuid,
+    service: &str,
+    environment: &str,
+) -> Result<String, ApiError> {
+    let base = domains::base_label(service, environment);
+    let taken: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM services WHERE server_id = $1 AND host_label = $2 AND id <> $3)",
+    )
+    .bind(server_id)
+    .bind(&base)
+    .bind(service_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(domains::unique_label(base, taken, service_id))
+}
+
 const NAME_TAKEN: &str = "A service with this name already exists in the environment";
 
 pub async fn create(
@@ -162,13 +201,16 @@ pub async fn create(
     let memory = check_memory(body.memory_mib.unwrap_or(DEFAULT_MEMORY_MIB))?;
     let port = body.port.map(check_port).transpose()?;
     check_env(&body.env)?;
-    require_environment(&state.pool, user.id, environment_id).await?;
+    let environment = require_environment(&state.pool, user.id, environment_id).await?;
     check_server(&state.pool, user.id, body.server_id).await?;
 
-    let id: Uuid = sqlx::query_scalar(
-        "INSERT INTO services (environment_id, name, image, vcpus, memory_mib, env, port, server_id) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
+    let id = Uuid::new_v4();
+    let label = free_label(&state.pool, body.server_id, id, &name, &environment).await?;
+    sqlx::query(
+        "INSERT INTO services (id, environment_id, name, image, vcpus, memory_mib, env, port, \
+         server_id, host_label) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
     )
+    .bind(id)
     .bind(environment_id)
     .bind(&name)
     .bind(&image)
@@ -177,11 +219,15 @@ pub async fn create(
     .bind(Jsonb(&body.env))
     .bind(port)
     .bind(body.server_id)
-    .fetch_one(&state.pool)
+    .bind(&label)
+    .execute(&state.pool)
     .await
     .map_err(|e| conflict_on_unique(e, NAME_TAKEN))?;
     let row = owned_service(&state.pool, user.id, id).await?;
-    Ok((StatusCode::CREATED, Json(row.into())))
+    Ok((
+        StatusCode::CREATED,
+        Json(row.into_service(&state.config.domain_base)),
+    ))
 }
 
 pub async fn list(
@@ -196,7 +242,11 @@ pub async fn list(
     .bind(environment_id)
     .fetch_all(&state.pool)
     .await?;
-    Ok(Json(rows.into_iter().map(Into::into).collect()))
+    Ok(Json(
+        rows.into_iter()
+            .map(|r| r.into_service(&state.config.domain_base))
+            .collect(),
+    ))
 }
 
 pub async fn get(
@@ -204,7 +254,8 @@ pub async fn get(
     AuthUser(user): AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Service>, ApiError> {
-    Ok(Json(owned_service(&state.pool, user.id, id).await?.into()))
+    let row = owned_service(&state.pool, user.id, id).await?;
+    Ok(Json(row.into_service(&state.config.domain_base)))
 }
 
 /// Changes the config of a service. Running VMs keep their old config until
@@ -228,12 +279,29 @@ pub async fn update(
     if let Some(env) = &body.env {
         check_env(env)?;
     }
+    // A move to another server gets a label that is free there; otherwise the URL stays.
+    let mut label = None;
     if let Some(server_id) = body.server_id {
         check_server(&state.pool, user.id, server_id).await?;
-        if server_id != current.server_id && deployments::has_active(&state.pool, id).await? {
-            return Err(ApiError::Conflict(
-                "Stop the service before moving it to another server".into(),
-            ));
+        if server_id != current.server_id {
+            if deployments::has_active(&state.pool, id).await? {
+                return Err(ApiError::Conflict(
+                    "Stop the service before moving it to another server".into(),
+                ));
+            }
+            let base = current
+                .host_label
+                .strip_suffix(&format!("-{}", &id.simple().to_string()[..6]))
+                .unwrap_or(&current.host_label)
+                .to_string();
+            let taken: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM services WHERE server_id = $1 AND host_label = $2)",
+            )
+            .bind(server_id)
+            .bind(&base)
+            .fetch_one(&state.pool)
+            .await?;
+            label = Some(domains::unique_label(base, taken, id));
         }
     }
 
@@ -241,7 +309,8 @@ pub async fn update(
         "UPDATE services SET name = COALESCE($2, name), image = COALESCE($3, image), \
          vcpus = COALESCE($4, vcpus), memory_mib = COALESCE($5, memory_mib), \
          env = COALESCE($6, env), port = COALESCE($7, port), \
-         server_id = COALESCE($8, server_id), updated_at = now() WHERE id = $1 RETURNING id",
+         server_id = COALESCE($8, server_id), host_label = COALESCE($9, host_label), \
+         updated_at = now() WHERE id = $1 RETURNING id",
     )
     .bind(id)
     .bind(name)
@@ -251,10 +320,12 @@ pub async fn update(
     .bind(body.env.as_ref().map(Jsonb))
     .bind(port)
     .bind(body.server_id)
+    .bind(label)
     .fetch_one(&state.pool)
     .await
     .map_err(|e| conflict_on_unique(e, NAME_TAKEN))?;
-    Ok(Json(owned_service(&state.pool, user.id, id).await?.into()))
+    let row = owned_service(&state.pool, user.id, id).await?;
+    Ok(Json(row.into_service(&state.config.domain_base)))
 }
 
 /// Deleting a service stops its VM first (once the agent is reachable).
