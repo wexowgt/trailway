@@ -658,3 +658,248 @@ async fn install_script_is_served() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
 }
+
+// ---- ledger ----
+
+struct Box {
+    cookie: String,
+    token: String,
+    server_id: String,
+}
+
+async fn online_box(app: &Router) -> Box {
+    let cookie = signup(app, &unique_email()).await;
+    let (_, secret) = create_key(app, &cookie).await;
+    let reg = call_bearer(
+        app,
+        Method::POST,
+        "/api/v1/agent/register",
+        &secret,
+        Some(register_body(&uuid::Uuid::new_v4().to_string())),
+    )
+    .await;
+    let token = reg.json["token"].as_str().unwrap().to_string();
+    let hb = call_bearer(
+        app,
+        Method::POST,
+        "/api/v1/agent/heartbeat",
+        &token,
+        Some(heartbeat_body()),
+    )
+    .await;
+    assert_eq!(hb.status, StatusCode::NO_CONTENT);
+    Box {
+        cookie,
+        token,
+        server_id: reg.json["server_id"].as_str().unwrap().to_string(),
+    }
+}
+
+/// Sample ending `ago` seconds ago and lasting `len` seconds.
+fn sample_body(ago: i64, len: i64, cpu_used: u64, kvm: bool) -> Value {
+    let end = chrono::Utc::now() - chrono::Duration::seconds(ago);
+    json!({
+        "period_start": end - chrono::Duration::seconds(len),
+        "period_end": end,
+        "cpu": {"total": 4000, "used": cpu_used},
+        "memory": {"total": 8u64 << 30, "used": 2u64 << 30},
+        "kvm": kvm
+    })
+}
+
+async fn send_sample(app: &Router, b: &Box, body: Value) -> Reply {
+    call_bearer(
+        app,
+        Method::POST,
+        "/api/v1/agent/usage",
+        &b.token,
+        Some(body),
+    )
+    .await
+}
+
+async fn balance(app: &Router, b: &Box) -> Value {
+    let r = call(
+        app,
+        Method::GET,
+        "/api/v1/ledger/balance",
+        Some(&b.cookie),
+        None,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK);
+    r.json
+}
+
+#[tokio::test]
+async fn idle_capacity_is_credited_and_own_usage_is_not() {
+    let Some((app, _)) = setup().await else {
+        return;
+    };
+    let b = online_box(&app).await;
+    // 10 s with 1 of 4 cores and 2 of 8 GiB in use: 3 vCPU and 6 GiB idle.
+    let r = send_sample(&app, &b, sample_body(0, 10, 1000, true)).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(r.json["outcome"], "credited");
+    let bal = balance(&app, &b).await;
+    assert_eq!(bal["contributed"]["vcpu_seconds"], 30.0);
+    assert_eq!(bal["contributed"]["gb_seconds"], 60.0);
+    assert_eq!(bal["consumed"]["vcpu_seconds"], 0.0);
+    assert_eq!(bal["balance"]["vcpu_seconds"], 30.0);
+
+    // Fully busy server earns nothing more.
+    let r = send_sample(&app, &b, sample_body(20, 10, 4000, true)).await;
+    assert_eq!(r.json["outcome"], "credited", "memory is still idle");
+    let bal = balance(&app, &b).await;
+    assert_eq!(bal["contributed"]["vcpu_seconds"], 30.0, "no idle cpu");
+    assert_eq!(
+        bal["contributed"]["gb_seconds"], 120.0,
+        "idle memory still counts"
+    );
+}
+
+#[tokio::test]
+async fn offline_stale_and_no_kvm_earn_nothing() {
+    let Some((app, pool)) = setup().await else {
+        return;
+    };
+    let b = online_box(&app).await;
+    let no_kvm = send_sample(&app, &b, sample_body(0, 60, 0, false)).await;
+    assert_eq!(no_kvm.json["outcome"], "uncredited");
+    let stale = send_sample(&app, &b, sample_body(600, 60, 0, true)).await;
+    assert_eq!(stale.json["outcome"], "uncredited");
+
+    sqlx::query(
+        "UPDATE servers SET last_heartbeat_at = now() - interval '31 seconds' WHERE id = $1::uuid",
+    )
+    .bind(&b.server_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let offline = send_sample(&app, &b, sample_body(120, 60, 0, true)).await;
+    assert_eq!(offline.json["outcome"], "uncredited");
+    let bal = balance(&app, &b).await;
+    assert_eq!(bal["contributed"]["vcpu_seconds"], 0.0);
+    assert_eq!(bal["contributed"]["gb_seconds"], 0.0);
+}
+
+#[tokio::test]
+async fn duplicate_and_overlapping_samples_count_once_out_of_order_ok() {
+    let Some((app, _)) = setup().await else {
+        return;
+    };
+    let b = online_box(&app).await;
+    let later = sample_body(0, 20, 0, true);
+    let earlier = sample_body(25, 20, 0, true);
+    assert_eq!(
+        send_sample(&app, &b, later.clone()).await.json["outcome"],
+        "credited"
+    );
+    assert_eq!(
+        send_sample(&app, &b, later.clone()).await.json["outcome"],
+        "duplicate"
+    );
+    // Shifted by 10 s: overlaps the stored one.
+    let overlap = sample_body(10, 20, 0, true);
+    assert_eq!(
+        send_sample(&app, &b, overlap).await.json["outcome"],
+        "duplicate"
+    );
+    // An older, non-overlapping sample arriving afterwards is credited once.
+    assert_eq!(
+        send_sample(&app, &b, earlier.clone()).await.json["outcome"],
+        "credited"
+    );
+    assert_eq!(
+        send_sample(&app, &b, earlier).await.json["outcome"],
+        "duplicate"
+    );
+    // 2 x 20 s x 4 vCPU
+    assert_eq!(
+        balance(&app, &b).await["contributed"]["vcpu_seconds"],
+        160.0
+    );
+}
+
+#[tokio::test]
+async fn entries_page_and_series_and_ownership() {
+    let Some((app, pool)) = setup().await else {
+        return;
+    };
+    let b = online_box(&app).await;
+    for i in 0..3 {
+        let r = send_sample(&app, &b, sample_body(i * 12, 10, 0, true)).await;
+        assert_eq!(r.json["outcome"], "credited");
+    }
+    let p1 = call(
+        &app,
+        Method::GET,
+        "/api/v1/ledger/entries?limit=2",
+        Some(&b.cookie),
+        None,
+    )
+    .await;
+    assert_eq!(p1.json["entries"].as_array().unwrap().len(), 2);
+    assert_eq!(p1.json["entries"][0]["kind"], "contributed");
+    let cursor = p1.json["next_before"].as_i64().unwrap();
+    let p2 = call(
+        &app,
+        Method::GET,
+        &format!("/api/v1/ledger/entries?limit=2&before={cursor}"),
+        Some(&b.cookie),
+        None,
+    )
+    .await;
+    assert_eq!(p2.json["entries"].as_array().unwrap().len(), 1);
+    assert!(p2.json["next_before"].is_null());
+
+    let series = call(
+        &app,
+        Method::GET,
+        &format!("/api/v1/servers/{}/usage", b.server_id),
+        Some(&b.cookie),
+        None,
+    )
+    .await;
+    assert_eq!(series.status, StatusCode::OK);
+    let pts = series.json.as_array().unwrap();
+    assert_eq!(pts.len(), 3);
+    assert!(
+        pts[0]["period_end"].as_str() < pts[2]["period_end"].as_str(),
+        "oldest first"
+    );
+    assert_eq!(pts[0]["credited"], true);
+
+    // Another user can neither see the series nor the ledger entries.
+    let other = signup(&app, &unique_email()).await;
+    let r = call(
+        &app,
+        Method::GET,
+        &format!("/api/v1/servers/{}/usage", b.server_id),
+        Some(&other),
+        None,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    let r = call(
+        &app,
+        Method::GET,
+        "/api/v1/ledger/entries",
+        Some(&other),
+        None,
+    )
+    .await;
+    assert_eq!(r.json["entries"].as_array().unwrap().len(), 0);
+
+    // The ledger is append-only.
+    let upd = sqlx::query("UPDATE ledger_entries SET millicore_seconds = 0")
+        .execute(&pool)
+        .await;
+    assert!(upd.is_err());
+
+    // Auth is required.
+    let r = call(&app, Method::GET, "/api/v1/ledger/balance", None, None).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+    let r = send_sample(&app, &b, sample_body(0, 600, 0, true)).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+}

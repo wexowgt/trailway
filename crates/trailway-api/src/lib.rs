@@ -4,6 +4,7 @@ mod crypto;
 mod deployments;
 mod error;
 mod hub;
+mod ledger;
 mod projects;
 mod server_keys;
 mod servers;
@@ -124,7 +125,11 @@ pub fn router(state: AppState) -> Router {
         .route("/services/{id}/stop", post(deployments::stop))
         .route("/services/{id}/deployments", get(deployments::list))
         .route("/deployments/{id}", get(deployments::get))
-        .route("/deployments/{id}/logs", get(deployments::logs));
+        .route("/deployments/{id}/logs", get(deployments::logs))
+        .route("/agent/usage", post(ledger::ingest_usage))
+        .route("/servers/{id}/usage", get(ledger::server_usage))
+        .route("/ledger/balance", get(ledger::balance))
+        .route("/ledger/entries", get(ledger::entries));
     Router::new()
         .route("/healthz", get(healthz))
         .route("/install.sh", get(install_script))

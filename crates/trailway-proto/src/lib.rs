@@ -82,6 +82,100 @@ pub struct Server {
     pub created_at: DateTime<Utc>,
 }
 
+/// Longest interval one usage sample may cover.
+pub const MAX_SAMPLE_SECS: i64 = 300;
+
+/// Body of `POST /api/v1/agent/usage`, authenticated with the server token.
+/// One sample covers `[period_start, period_end)` and is aggregated by the
+/// agent from its heartbeats. `used` is what the owner's own workloads
+/// (and the host) consumed; `total - used` is the idle capacity offered to the
+/// pool. CPU is in millicores, memory in bytes, both averaged over the period
+/// (`total` is the latest seen).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageSample {
+    pub period_start: DateTime<Utc>,
+    pub period_end: DateTime<Utc>,
+    pub cpu: Resource,
+    pub memory: Resource,
+    /// `/dev/kvm` was available for the whole period.
+    pub kvm: bool,
+}
+
+/// What the API did with a usage sample.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageOutcome {
+    /// Stored and idle capacity credited to the owner.
+    Credited,
+    /// Stored for the usage series but earned nothing (offline, no KVM, no
+    /// idle capacity or stale).
+    Uncredited,
+    /// Overlaps a sample already stored; ignored so nothing is counted twice.
+    Duplicate,
+}
+
+/// Response of `POST /api/v1/agent/usage`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageAck {
+    pub outcome: UsageOutcome,
+}
+
+/// Compute in the two units the ledger keeps apart.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct Compute {
+    pub vcpu_seconds: f64,
+    /// Gibibyte-seconds (1 GB = 2^30 bytes).
+    pub gb_seconds: f64,
+}
+
+/// Response of `GET /api/v1/ledger/balance`. `balance = contributed - consumed`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct LedgerBalance {
+    pub contributed: Compute,
+    pub consumed: Compute,
+    pub balance: Compute,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LedgerKind {
+    Contributed,
+    Consumed,
+}
+
+/// One append-only ledger entry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LedgerEntry {
+    /// Monotonic position in the ledger, used as the paging cursor.
+    pub seq: i64,
+    pub kind: LedgerKind,
+    pub server_id: Option<Uuid>,
+    pub period_start: DateTime<Utc>,
+    pub period_end: DateTime<Utc>,
+    pub vcpu_seconds: f64,
+    pub gb_seconds: f64,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Response of `GET /api/v1/ledger/entries`, newest first. Pass
+/// `next_before` as `before` to get the next page.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LedgerEntries {
+    pub entries: Vec<LedgerEntry>,
+    pub next_before: Option<i64>,
+}
+
+/// One point of `GET /api/v1/servers/{id}/usage`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsagePoint {
+    pub period_start: DateTime<Utc>,
+    pub period_end: DateTime<Utc>,
+    pub cpu: Resource,
+    pub memory: Resource,
+    pub kvm: bool,
+    pub credited: bool,
+}
+
 /// Response body of the API health endpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Health {

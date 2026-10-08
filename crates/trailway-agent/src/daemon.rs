@@ -11,13 +11,18 @@ use trailway_agent::{
     session::{self, SessionError},
 };
 
+use chrono::Utc;
+
 use crate::{
     client::{ApiClient, ClientError},
     config::{Config, State},
     host,
+    usage::UsageWindow,
 };
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+/// One usage sample is sent per this many seconds, aggregated from heartbeats.
+const USAGE_INTERVAL_SECS: i64 = 60;
 const RETRY_DELAY: Duration = Duration::from_secs(5);
 const MIN_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
@@ -78,9 +83,11 @@ async fn heartbeats(shared: Arc<Shared>) {
     let mut sampler = host::Sampler::new();
     let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut window = UsageWindow::new(Utc::now());
     loop {
         ticker.tick().await;
         let hb = sampler.heartbeat();
+        window.push(&hb);
         let token = shared.token().await;
         match shared.client.heartbeat(&token, &hb).await {
             Ok(()) => tracing::debug!("heartbeat sent"),
@@ -89,6 +96,23 @@ async fn heartbeats(shared: Arc<Shared>) {
                 shared.reregister(&token).await;
             }
             Err(e) => tracing::warn!("heartbeat failed: {e}"),
+        }
+        let now = Utc::now();
+        if (now - window.start()).num_seconds() >= USAGE_INTERVAL_SECS {
+            let (sample, next) = window.flush(now);
+            window = next;
+            if let Some(sample) = sample {
+                // Not buffered: a sample that misses its window earns nothing.
+                let token = shared.token().await;
+                match shared.client.usage(&token, &sample).await {
+                    Ok(ack) => tracing::debug!(?ack.outcome, "usage sample sent"),
+                    Err(ClientError::Unauthorized) => {
+                        tracing::warn!("server token rejected, registering again");
+                        shared.reregister(&token).await;
+                    }
+                    Err(e) => tracing::warn!("usage sample failed: {e}"),
+                }
+            }
         }
     }
 }

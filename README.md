@@ -77,3 +77,7 @@ On a Linux host with KVM: `sudo scripts/setup-host.sh`, then
 Paths are overridable via `TRAILWAY_DATA_DIR`, `TRAILWAY_KERNEL`,
 `TRAILWAY_FIRECRACKER`, `TRAILWAY_BUSYBOX`. Rootfs images are cached per
 image digest under `$TRAILWAY_DATA_DIR/images/`.
+
+## Ledger
+
+Every 60 s the agent sends a usage sample (`POST /api/v1/agent/usage`, averaged from its heartbeats: total and used CPU/RAM). The API credits the idle part (`total - used`) to the server owner as an append-only `contributed` ledger entry, in vCPU-seconds and GB-seconds (1 GB = 2^30 bytes), kept separate. Offline servers, servers without KVM, stale samples and duplicate or overlapping samples earn nothing. `GET /api/v1/ledger/balance`, `GET /api/v1/ledger/entries?limit=&before=` and `GET /api/v1/servers/{id}/usage?from=&to=` read it back. Borrowing (`consumed` entries) is not implemented yet.

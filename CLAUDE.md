@@ -16,6 +16,12 @@ Railway-like deploy platform on a shared server pool. See README.md for the prod
 - `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`
 - `cd web && pnpm dev | pnpm lint | pnpm build`
 
+## Web and API
+
+- The browser only talks to the Next origin. `web/next.config.ts` rewrites `/api/v1/*`, `/install.sh` and `/downloads/*` to the Rust API (`API_URL`, default `http://127.0.0.1:8080`), so the `tw_session` cookie is same-origin and the install command uses `window.location.origin`.
+- `web/middleware.ts` redirects to `/login` without a session cookie; `web/app/(app)/layout.tsx` validates it with `GET /api/v1/me`.
+- Servers page polls `/servers` every 5s. Local run: Postgres, `cargo run -p trailway-api`, `cd web && pnpm dev`.
+
 ## Conventions
 
 - CI (`.github/workflows/ci.yml`) must stay green: fmt, clippy `-D warnings`, tests, web lint and build.
