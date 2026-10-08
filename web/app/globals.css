@@ -199,3 +199,38 @@ a.svc-url:hover { text-decoration: underline; }
 .pill.running { color: var(--ok); }
 .pill.failed { color: var(--bad); }
 .pill.queued, .pill.building, .pill.deploying { color: var(--accent); }
+
+/* Observability, logs and credits */
+.obs { display: grid; gap: 1rem; max-width: 1400px; margin: 0 auto; padding: 1.25rem 1rem 3rem; }
+.obs-bar { display: flex; gap: 0.75rem; align-items: center; }
+body:has(.obs) .page { max-width: none; padding: 0; display: block; }
+.card h2 { margin: 0; font-size: 1rem; font-weight: 500; }
+.errlogs { overflow: auto; max-height: 360px; }
+.errlogs h2, .chart h2 { padding: 1rem 1.25rem; }
+.errlogs table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+.errlogs th { text-align: left; font-weight: 400; color: var(--muted); padding: 0.5rem 1rem; border-top: 1px solid var(--border); position: sticky; top: 0; background: var(--surface); }
+.errlogs td { padding: 0.3rem 1rem; vertical-align: top; }
+.errlogs td:first-child { white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted); }
+.errrow { background: rgba(248, 113, 113, 0.07); }
+.errrow td:first-child { border-left: 3px solid var(--bad); }
+.logtext { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; word-break: break-all; }
+.charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 1rem; }
+.chart-box { height: 260px; padding: 0 0.5rem 0 0.25rem; }
+.chart-empty { padding: 0 1.25rem 1.5rem; }
+.legend { list-style: none; margin: 0; padding: 0.75rem 1.25rem 1rem; display: flex; flex-wrap: wrap; gap: 0.4rem 1.25rem; font-size: 0.8rem; }
+.swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 0.4rem; }
+.logbox { height: calc(100vh - 170px); min-height: 300px; overflow: auto; padding: 0.5rem 0; font-size: 0.8rem; }
+.logempty { padding: 1rem 1.25rem; }
+.logline { display: grid; grid-template-columns: 9.5rem 8rem 1fr; gap: 0.75rem; padding: 0.1rem 1rem; border-left: 3px solid transparent; }
+.logline time { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; white-space: nowrap; }
+.logsvc { color: var(--accent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.logline.err { background: rgba(248, 113, 113, 0.07); border-left-color: var(--bad); }
+.credit-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 1rem; }
+.credit { padding: 1.25rem; display: grid; gap: 0.4rem; }
+.credit h2 { color: var(--muted); font-size: 0.85rem; font-weight: 400; }
+.credit-value { margin: 0; line-height: 1.5; }
+.num { font-size: 1.5rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+@media (max-width: 640px) {
+  .logline { grid-template-columns: 1fr; gap: 0; }
+  .charts { grid-template-columns: 1fr; }
+}

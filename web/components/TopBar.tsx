@@ -37,21 +37,38 @@ export function TopBar({ email }: { email: string }) {
         )}
         <Link href="/projects" className={`tab${pathname === "/projects" ? " active" : ""}`}>Projects</Link>
         <Link href="/servers" className={`tab${onServers ? " active" : ""}`}>Servers</Link>
+        <Link href="/credits" className={`tab${pathname.startsWith("/credits") ? " active" : ""}`}>Credits</Link>
         <AvatarMenu email={email} />
       </nav>
     </header>
   );
 }
 
+const PROJECT_TABS = [
+  { path: "", label: "Architecture" },
+  { path: "/observability", label: "Observability" },
+  { path: "/logs", label: "Logs" },
+];
+
 function ProjectTab({ projectId }: { projectId: string }) {
   const env = useSearchParams().get("env");
+  const pathname = usePathname();
+  const base = `/projects/${projectId}`;
   return (
-    <Link
-      href={`/projects/${projectId}${env ? `?env=${env}` : ""}`}
-      aria-current="page"
-      className="tab active"
-    >
-      Architecture
-    </Link>
+    <>
+      {PROJECT_TABS.map((t) => {
+        const active = pathname === `${base}${t.path}`;
+        return (
+          <Link
+            key={t.label}
+            href={`${base}${t.path}${env ? `?env=${env}` : ""}`}
+            aria-current={active ? "page" : undefined}
+            className={`tab${active ? " active" : ""}`}
+          >
+            {t.label}
+          </Link>
+        );
+      })}
+    </>
   );
 }
