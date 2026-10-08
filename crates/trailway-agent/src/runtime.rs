@@ -2,6 +2,7 @@
 
 use anyhow::{bail, Result};
 use std::collections::BTreeMap;
+use std::io::{Cursor, Read};
 use std::sync::Mutex;
 use trailway_proto::{VmInfo, VmSpec, VmState};
 
@@ -14,6 +15,9 @@ pub trait Runtime {
     fn start(&self, spec: &VmSpec) -> Result<String>;
     fn stop(&self, id: &str) -> Result<()>;
     fn status(&self, id: &str) -> Result<VmInfo>;
+    /// The VM's console output (kernel and app stdout/stderr). With `follow`
+    /// the reader blocks for new output until the VM exits.
+    fn logs(&self, id: &str, follow: bool) -> Result<Box<dyn Read + Send>>;
 }
 
 /// Rejects specs no runtime can honour.
@@ -26,6 +30,12 @@ pub fn validate_spec(spec: &VmSpec) -> Result<()> {
     }
     if spec.mem_mib < MIN_MEM_MIB {
         bail!("mem must be at least {MIN_MEM_MIB} MiB");
+    }
+    if spec.port == Some(0) || spec.host_port == Some(0) {
+        bail!("ports must be between 1 and 65535");
+    }
+    if spec.host_port.is_some() && spec.port.is_none() {
+        bail!("host port needs an app port");
     }
     if let Some((k, _)) = spec
         .env
@@ -55,6 +65,7 @@ impl Runtime for FakeRuntime {
                 spec: spec.clone(),
                 state: VmState::Running,
                 image_digest: "sha256:fake".into(),
+                network: None,
             },
         );
         Ok(id)
@@ -76,6 +87,11 @@ impl Runtime for FakeRuntime {
             None => bail!("unknown vm {id}"),
         }
     }
+
+    fn logs(&self, id: &str, _follow: bool) -> Result<Box<dyn Read + Send>> {
+        self.status(id)?;
+        Ok(Box::new(Cursor::new(format!("fake log for {id}\n"))))
+    }
 }
 
 #[cfg(test)]
@@ -89,6 +105,8 @@ mod tests {
             mem_mib: 256,
             env: vec![],
             cmd: vec![],
+            port: None,
+            host_port: None,
         }
     }
 
@@ -109,6 +127,19 @@ mod tests {
     }
 
     #[test]
+    fn logs_for_known_vm_only() {
+        let rt = FakeRuntime::default();
+        let id = rt.start(&spec()).unwrap();
+        let mut out = String::new();
+        rt.logs(&id, false)
+            .unwrap()
+            .read_to_string(&mut out)
+            .unwrap();
+        assert!(out.contains(&id));
+        assert!(rt.logs("nope", false).is_err());
+    }
+
+    #[test]
     fn rejects_bad_specs() {
         let rt = FakeRuntime::default();
         for bad in [
@@ -119,6 +150,14 @@ mod tests {
             },
             VmSpec {
                 mem_mib: 8,
+                ..spec()
+            },
+            VmSpec {
+                port: Some(0),
+                ..spec()
+            },
+            VmSpec {
+                host_port: Some(8080),
                 ..spec()
             },
             VmSpec {

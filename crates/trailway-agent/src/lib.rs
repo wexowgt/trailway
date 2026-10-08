@@ -3,4 +3,5 @@
 pub mod firecracker;
 pub mod image;
 pub mod init;
+pub mod net;
 pub mod runtime;

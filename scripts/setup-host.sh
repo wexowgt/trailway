@@ -17,7 +17,7 @@ fi
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq curl ca-certificates e2fsprogs busybox-static skopeo umoci
+apt-get install -y -qq curl ca-certificates e2fsprogs busybox-static skopeo umoci iproute2 nftables
 
 if ! command -v firecracker >/dev/null || ! firecracker --version | grep -q "${FC_VERSION#v}"; then
   tmp="$(mktemp -d)"

@@ -36,6 +36,23 @@ pub struct VmSpec {
     /// Overrides the image's entrypoint and cmd when non-empty.
     #[serde(default)]
     pub cmd: Vec<String>,
+    /// Port the app listens on inside the VM. When set, a host port is forwarded to it.
+    #[serde(default)]
+    pub port: Option<u16>,
+    /// Host port to forward to `port`; a random free one is chosen when unset.
+    #[serde(default)]
+    pub host_port: Option<u16>,
+}
+
+/// Network attachment of a running microVM.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VmNetwork {
+    /// Private guest address on the `trailway0` bridge.
+    pub ip: String,
+    pub mac: String,
+    pub tap: String,
+    pub host_port: Option<u16>,
+    pub app_port: Option<u16>,
 }
 
 /// Lifecycle state of a microVM.
@@ -54,6 +71,8 @@ pub struct VmInfo {
     pub state: VmState,
     /// Resolved image digest the rootfs was built from.
     pub image_digest: String,
+    #[serde(default)]
+    pub network: Option<VmNetwork>,
 }
 
 /// Body of `POST /api/v1/auth/signup` and `POST /api/v1/auth/login`.
@@ -145,5 +164,6 @@ mod tests {
         let spec: VmSpec =
             serde_json::from_str(r#"{"image":"nginx","vcpus":1,"mem_mib":256}"#).unwrap();
         assert!(spec.env.is_empty() && spec.cmd.is_empty());
+        assert!(spec.port.is_none() && spec.host_port.is_none());
     }
 }

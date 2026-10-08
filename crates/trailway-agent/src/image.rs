@@ -210,11 +210,15 @@ pub fn make_config_drive(
     spec: &VmSpec,
     image: &ImageConfig,
     scratch: &Path,
+    net_script: Option<&str>,
 ) -> Result<()> {
     let (env, cmd) = resolve_process(spec, image)?;
     let dir = scratch.join("cfg");
     fs::create_dir_all(&dir)?;
     fs::write(dir.join("run.sh"), run_script(&env, &image.cwd, &cmd))?;
+    if let Some(net) = net_script {
+        fs::write(dir.join("net.sh"), net)?;
+    }
     make_ext4(path, &dir, CONFIG_DRIVE_MIB)
 }
 
@@ -263,6 +267,8 @@ mod tests {
             mem_mib: 256,
             env: vec![],
             cmd: vec![],
+            port: None,
+            host_port: None,
         }
     }
 
