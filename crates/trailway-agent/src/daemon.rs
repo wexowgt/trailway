@@ -117,7 +117,7 @@ async fn jobs(shared: Arc<Shared>, manager: Arc<Manager>) {
 }
 
 fn runtime() -> SharedRuntime {
-    if std::env::var("TRAILWAY_FAKE_RUNTIME").is_ok_and(|v| v == "1") {
+    if host::fake_runtime() {
         tracing::warn!("TRAILWAY_FAKE_RUNTIME=1: VMs are simulated, nothing really runs");
         return Arc::new(FakeRuntime::default());
     }
