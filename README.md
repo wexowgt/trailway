@@ -41,6 +41,25 @@ The API serves binaries from `API_AGENT_DIST_DIR` (files `trailway-agent-linux-x
 
 Reaching a local API from a remote test box: `ssh -R 18080:127.0.0.1:18080 root@<host>`, then install with `--api http://127.0.0.1:18080` on the box. `TRAILWAY_MACHINE_ID` overrides the machine id when running the agent on a host without `/etc/machine-id` (macOS dev).
 
+## Deploying a service
+
+All routes need the session cookie. Project -> environments -> services -> deployments:
+
+```sh
+POST /api/v1/projects {"name"}                       GET/PATCH/DELETE /api/v1/projects/{id}
+POST /api/v1/projects/{id}/environments {"name"}     GET/PATCH/DELETE /api/v1/environments/{id}
+POST /api/v1/environments/{id}/services              GET/PATCH/DELETE /api/v1/services/{id}
+     {"name","image","vcpus","memory_mib","env":{},"port","server_id"}
+POST /api/v1/services/{id}/deploy                    202 + deployment (queued)
+POST /api/v1/services/{id}/stop                      removes the VM, keeps the service
+GET  /api/v1/services/{id}/deployments               GET /api/v1/deployments/{id}
+GET  /api/v1/deployments/{id}/logs[?follow=true]     console output as text
+```
+
+`server_id` must be one of the caller's servers. A deploy is refused with 409 `insufficient_capacity` when the server's free CPU or memory (from the last heartbeat, plus the service's own VM that is being replaced, minus deploys still on their way) is too small, `server_offline` without a recent heartbeat and `kvm_unavailable` without `/dev/kvm`. Config changes (PATCH) apply on the next deploy, which stops the old VM and starts the new one. Deleting a service, environment or project stops its VMs first.
+
+The agent keeps one outbound WebSocket (`GET /api/v1/agent/ws`, server token) so it works behind NAT. The API sends `deploy` and `stop` jobs; the agent reports `queued`, `building` (image pull), `deploying`, `running` (with the forwarded host port), `failed` or `stopped`, and streams the console log in chunks keyed by byte offset. After every (re)connect the agent sends `hello` with the actual state of each deployment it knows (kept in `deployments.json` next to `state.json`) and the API reconciles: lost jobs are handed over again, VMs that are gone are marked failed, unwanted ones are stopped. Types are in `crates/trailway-proto`. `TRAILWAY_FAKE_RUNTIME=1` runs the agent with simulated VMs (no KVM needed) for local development.
+
 ## Checks (same as CI)
 
 ```sh

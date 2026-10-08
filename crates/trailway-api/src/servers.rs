@@ -82,7 +82,7 @@ impl FromRequestParts<AppState> for ServerAuth {
     }
 }
 
-fn check_text(name: &str, value: &str) -> Result<String, ApiError> {
+pub(crate) fn check_text(name: &str, value: &str) -> Result<String, ApiError> {
     let v = value.trim();
     if v.is_empty() || v.chars().count() > MAX_FIELD_LEN || v.chars().any(char::is_control) {
         return Err(ApiError::validation(format!("{name} is not valid")));

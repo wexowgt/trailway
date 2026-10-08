@@ -21,10 +21,7 @@ async fn setup() -> Option<(Router, PgPool)> {
         .await
         .expect("connect to TEST_DATABASE_URL");
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-    let state = AppState {
-        pool: pool.clone(),
-        config: Config::default(),
-    };
+    let state = AppState::new(pool.clone(), Config::default());
     Some((router(state), pool))
 }
 

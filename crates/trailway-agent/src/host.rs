@@ -5,6 +5,11 @@ use trailway_proto::{Heartbeat, RegisterRequest, Resource};
 
 pub const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const KVM_DEVICE: &str = "/dev/kvm";
+
+/// `TRAILWAY_FAKE_RUNTIME=1` simulates VMs, so the host counts as able to run them.
+pub fn fake_runtime() -> bool {
+    std::env::var("TRAILWAY_FAKE_RUNTIME").is_ok_and(|v| v == "1")
+}
 const MACHINE_ID_PATHS: [&str; 2] = ["/etc/machine-id", "/var/lib/dbus/machine-id"];
 
 /// `TRAILWAY_MACHINE_ID` overrides detection (development on non-Linux hosts).
@@ -83,7 +88,7 @@ impl Sampler {
                 used: self.sys.used_memory().min(self.sys.total_memory()),
             },
             disk: disk_resource(&disks),
-            kvm: Path::new(KVM_DEVICE).exists(),
+            kvm: Path::new(KVM_DEVICE).exists() || fake_runtime(),
         }
     }
 }
