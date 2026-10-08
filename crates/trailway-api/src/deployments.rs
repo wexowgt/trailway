@@ -176,6 +176,7 @@ pub async fn deploy(
     let service = owned_service(&state.pool, user.id, service_id).await?;
     let spec = job_spec(&service);
     let source = git_of(service.git_url.clone(), service.git_branch.clone());
+    let domain = service.domain(&state.config.domain_base);
 
     let mut tx = state.pool.begin().await?;
     // Serialises deploys per server, so two deploys cannot both claim the same free capacity.
@@ -225,14 +226,14 @@ pub async fn deploy(
     check_fit(free, spec.vcpus, spec.mem_mib, &hostname)?;
 
     let row: DeploymentRow = sqlx::query_as(&format!(
-        "WITH d AS (INSERT INTO deployments (service_id, server_id, spec, source) \
-         VALUES ($1, $2, $3, $4) \
-         RETURNING *) SELECT {COLS} FROM d"
+        "WITH d AS (INSERT INTO deployments (service_id, server_id, spec, source, domain) \
+         VALUES ($1, $2, $3, $4, $5) RETURNING *) SELECT {COLS} FROM d"
     ))
     .bind(service_id)
     .bind(service.server_id)
     .bind(Jsonb(&spec))
     .bind(source.as_ref().map(Jsonb))
+    .bind(&domain)
     .fetch_one(&mut *tx)
     .await?;
     // The agent stops the old VM when it starts this one; a queued old
@@ -256,6 +257,7 @@ pub async fn deploy(
             service_id,
             spec,
             source,
+            domain,
         }),
     );
     Ok((StatusCode::ACCEPTED, Json(row.into())))

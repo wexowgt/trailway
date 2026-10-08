@@ -2,6 +2,7 @@ mod agent_ws;
 mod auth;
 mod crypto;
 mod deployments;
+mod domains;
 mod error;
 mod hub;
 mod ledger;
@@ -34,6 +35,10 @@ pub struct Config {
     /// Directory holding `trailway-agent-linux-<arch>` binaries served under
     /// `/downloads`. Unset disables the downloads.
     pub agent_dist_dir: Option<PathBuf>,
+    /// Domain services get their public host name under. `{ip}` stands for
+    /// the server's public IP with dashes, so the default needs no DNS setup;
+    /// a real wildcard domain such as `apps.example.com` replaces it later.
+    pub domain_base: String,
 }
 
 impl Default for Config {
@@ -42,12 +47,14 @@ impl Default for Config {
             cookie_secure: false,
             session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
             agent_dist_dir: None,
+            domain_base: domains::DEFAULT_DOMAIN_BASE.into(),
         }
     }
 }
 
 impl Config {
-    /// Reads `API_COOKIE_SECURE`, `API_SESSION_TTL_SECS` and `API_AGENT_DIST_DIR`.
+    /// Reads `API_COOKIE_SECURE`, `API_SESSION_TTL_SECS`, `API_AGENT_DIST_DIR` and
+    /// `API_DOMAIN_BASE`.
     pub fn from_env() -> anyhow::Result<Self> {
         let mut config = Self::default();
         if let Ok(v) = std::env::var("API_COOKIE_SECURE") {
@@ -57,6 +64,17 @@ impl Config {
             config.session_ttl_secs = v.parse()?;
         }
         config.agent_dist_dir = std::env::var_os("API_AGENT_DIST_DIR").map(PathBuf::from);
+        if let Ok(v) = std::env::var("API_DOMAIN_BASE") {
+            let base = v.trim().trim_matches('.');
+            anyhow::ensure!(
+                !base.is_empty()
+                    && base
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '{' | '}')),
+                "API_DOMAIN_BASE is not a valid domain"
+            );
+            config.domain_base = base.to_string();
+        }
         Ok(config)
     }
 }

@@ -146,11 +146,19 @@ pub async fn heartbeat(
     let (cpu_total, cpu_used) = check_resource("cpu", body.cpu)?;
     let (memory_total, memory_used) = check_resource("memory", body.memory)?;
     let (disk_total, disk_used) = check_resource("disk", body.disk)?;
+    let public_ip = match body.public_ip.as_deref() {
+        Some(ip) => Some(
+            ip.parse::<std::net::IpAddr>()
+                .map_err(|_| ApiError::validation("public_ip is not an IP address"))?
+                .to_string(),
+        ),
+        None => None,
+    };
 
     sqlx::query(
         "UPDATE servers SET agent_version = $2, cpu_total = $3, cpu_used = $4, \
          memory_total = $5, memory_used = $6, disk_total = $7, disk_used = $8, \
-         kvm = $9, last_heartbeat_at = now() WHERE id = $1",
+         kvm = $9, public_ip = COALESCE($10, public_ip), last_heartbeat_at = now() WHERE id = $1",
     )
     .bind(auth.server_id)
     .bind(&agent_version)
@@ -161,6 +169,7 @@ pub async fn heartbeat(
     .bind(disk_total)
     .bind(disk_used)
     .bind(body.kvm)
+    .bind(public_ip)
     .execute(&state.pool)
     .await?;
     Ok(StatusCode::NO_CONTENT)

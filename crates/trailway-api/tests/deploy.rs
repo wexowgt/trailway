@@ -144,12 +144,16 @@ struct Stack {
 }
 
 async fn new_stack(app: &Router, cookie: &str) -> Stack {
+    new_stack_in(app, cookie, "shop").await
+}
+
+async fn new_stack_in(app: &Router, cookie: &str, project: &str) -> Stack {
     let p = call(
         app,
         Method::POST,
         "/api/v1/projects",
         cookie,
-        Some(json!({"name": "shop"})),
+        Some(json!({"name": project})),
     )
     .await;
     assert_eq!(p.status, StatusCode::CREATED);
@@ -860,6 +864,118 @@ async fn reconnect_reconciles_with_what_the_agent_reports() {
             deployment_id: ghost
         }
     );
+}
+
+async fn heartbeat_with_ip(app: &Router, token: &str, ip: &str) -> StatusCode {
+    send(
+        app,
+        Method::POST,
+        "/api/v1/agent/heartbeat",
+        ("authorization", &format!("Bearer {token}")),
+        Some(json!({
+            "agent_version": "0.1.0",
+            "cpu": {"total": 4000, "used": 0},
+            "memory": {"total": 8 * GIB, "used": 0},
+            "disk": {"total": 100_000_000_000u64, "used": 0},
+            "kvm": true,
+            "public_ip": ip
+        })),
+    )
+    .await
+    .status
+}
+
+#[tokio::test]
+async fn services_get_a_stable_public_url_from_the_server_ip() {
+    let Some((app, _)) = setup().await else {
+        return;
+    };
+    let addr = serve(&app).await;
+    let cookie = signup(&app).await;
+    let (server, token) = add_server(&app, &cookie, 4000, 8 * GIB).await;
+    let stack = new_stack(&app, &cookie).await;
+    let web = json!({"name": "Hello", "image": "nginxdemos/hello", "port": 80});
+
+    // The IP is not known yet: no URL.
+    let svc = new_service(&app, &cookie, &stack.env_id, server, web.clone()).await;
+    assert_eq!(svc["url"], Value::Null);
+
+    assert_eq!(
+        heartbeat_with_ip(&app, &token, "not an ip").await,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        heartbeat_with_ip(&app, &token, "178.104.208.91").await,
+        StatusCode::NO_CONTENT
+    );
+    let sid = svc["id"].as_str().unwrap().to_string();
+    let url = "https://hello-production.178-104-208-91.sslip.io";
+    let got = call(
+        &app,
+        Method::GET,
+        &format!("/api/v1/services/{sid}"),
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(got.json["url"], url);
+
+    // The same name in another project on the same server gets a suffix.
+    let other = new_stack_in(&app, &cookie, "blog").await;
+    let twin = new_service(&app, &cookie, &other.env_id, server, web.clone()).await;
+    let twin_url = twin["url"].as_str().unwrap();
+    assert!(
+        twin_url.starts_with("https://hello-production-"),
+        "{twin_url}"
+    );
+    assert_ne!(twin_url, url);
+
+    // No port, no URL.
+    let worker = new_service(
+        &app,
+        &cookie,
+        &stack.env_id,
+        server,
+        json!({"name": "worker", "image": "busybox"}),
+    )
+    .await;
+    assert_eq!(worker["url"], Value::Null);
+
+    // The deploy job carries the domain, and a redeploy and a rename keep it.
+    let mut agent = Agent::connect(addr, &token).await;
+    agent.hello(vec![]).await;
+    for _ in 0..2 {
+        let r = call(
+            &app,
+            Method::POST,
+            &format!("/api/v1/services/{sid}/deploy"),
+            &cookie,
+            None,
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text);
+        let ApiMessage::Deploy(job) = agent.next().await else {
+            panic!("expected a deploy job");
+        };
+        assert_eq!(
+            job.domain.as_deref(),
+            Some("hello-production.178-104-208-91.sslip.io")
+        );
+        let id = job.deployment_id;
+        agent
+            .status(id, DeploymentStatus::Running, Some(30001))
+            .await;
+        wait_status(&app, &cookie, &id.to_string(), "running").await;
+        let renamed = call(
+            &app,
+            Method::PATCH,
+            &format!("/api/v1/services/{sid}"),
+            &cookie,
+            Some(json!({"name": "Renamed"})),
+        )
+        .await;
+        assert_eq!(renamed.json["url"], url);
+    }
 }
 
 #[tokio::test]
