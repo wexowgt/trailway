@@ -3,6 +3,7 @@
 //! reconnect or an agent restart.
 
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
@@ -11,7 +12,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use trailway_proto::{
-    AgentMessage, ApiMessage, DeployJob, DeploymentReport, DeploymentStatus, VmState,
+    AgentMessage, ApiMessage, DeployJob, DeploymentReport, DeploymentStatus, VmMetric, VmState,
 };
 use uuid::Uuid;
 
@@ -30,6 +31,9 @@ const LOG_POLL: Duration = Duration::from_millis(500);
 /// How often the proxy is made to match the running deployments again (Caddy
 /// may have restarted, or been missing when a deploy finished).
 const ROUTE_SYNC_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How often VM CPU and memory are reported.
+const METRICS_INTERVAL: Duration = Duration::from_secs(10);
 
 pub type SharedRuntime = Arc<dyn Runtime + Send + Sync>;
 pub type SharedBuilder = Arc<dyn Builder + Send + Sync>;
@@ -92,6 +96,8 @@ pub struct Manager {
     /// dropped: the next `attach` reports the full state again.
     sink: Mutex<Option<UnboundedSender<AgentMessage>>>,
     jobs: UnboundedSender<ApiMessage>,
+    /// CPU time seen at the previous metrics sample, by VM, to get a rate.
+    cpu_seen: Mutex<HashMap<String, (u64, std::time::Instant)>>,
 }
 
 impl Manager {
@@ -132,10 +138,12 @@ impl Manager {
             entries: Mutex::new(entries),
             sink: Mutex::new(None),
             jobs,
+            cpu_seen: Mutex::new(HashMap::new()),
         });
         manager.persist();
         tokio::spawn(worker(manager.clone(), rx));
         tokio::spawn(route_sync(manager.clone()));
+        tokio::spawn(metrics_loop(manager.clone()));
         manager
     }
 
@@ -230,6 +238,37 @@ impl Manager {
                 }
                 *last = Some(e);
             }
+        }
+    }
+
+    /// Sends the CPU and memory use of every running VM to the API. CPU is
+    /// the rate since the previous sample, so a VM's first sample only primes it.
+    pub fn sample_metrics(&self) {
+        let now = std::time::Instant::now();
+        let mut seen = self.cpu_seen.lock().unwrap();
+        let mut samples = vec![];
+        let mut live = vec![];
+        for e in self.entries() {
+            let (DeploymentStatus::Running, Some(vm_id)) = (e.status, e.vm_id) else {
+                continue;
+            };
+            let Ok(stats) = self.rt.stats(&vm_id) else {
+                continue;
+            };
+            live.push(vm_id.clone());
+            let previous = seen.insert(vm_id, (stats.cpu_micros, now));
+            if let Some((cpu, at)) = previous {
+                samples.push(VmMetric {
+                    deployment_id: e.deployment_id,
+                    cpu_millicores: millicores(cpu, stats.cpu_micros, now.duration_since(at)),
+                    memory_bytes: stats.memory_bytes,
+                });
+            }
+        }
+        seen.retain(|vm_id, _| live.contains(vm_id));
+        drop(seen);
+        if !samples.is_empty() {
+            self.emit(AgentMessage::Metrics { samples });
         }
     }
 
@@ -484,6 +523,31 @@ impl Manager {
     }
 }
 
+/// CPU rate in millicores from two cumulative CPU times and the time between them.
+fn millicores(before_micros: u64, after_micros: u64, elapsed: Duration) -> u64 {
+    let wall = elapsed.as_micros() as u64;
+    if wall == 0 {
+        return 0;
+    }
+    after_micros
+        .saturating_sub(before_micros)
+        .saturating_mul(1000)
+        / wall
+}
+
+/// Reports what the running VMs use, every few seconds.
+async fn metrics_loop(manager: Arc<Manager>) {
+    let mut ticker = tokio::time::interval(METRICS_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        let m = manager.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || m.sample_metrics()).await {
+            tracing::error!("metrics sampling panicked: {e}");
+        }
+    }
+}
+
 /// Keeps the proxy matching the running deployments.
 async fn route_sync(manager: Arc<Manager>) {
     let mut ticker = tokio::time::interval(ROUTE_SYNC_INTERVAL);
@@ -704,6 +768,34 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("deploy did not settle: {:?}", statuses(m));
+    }
+
+    #[tokio::test]
+    async fn running_vms_report_metrics_from_the_second_sample_on() {
+        let rt = Arc::new(FakeRuntime::default());
+        let m = manager(rt, None);
+        let (tx, mut rx) = unbounded_channel();
+        m.attach(tx);
+        let job = job(Uuid::new_v4(), "nginx");
+        let id = job.deployment_id;
+        m.submit(ApiMessage::Deploy(job));
+        settle(&m).await;
+
+        m.sample_metrics();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        m.sample_metrics();
+        let mut metrics = vec![];
+        while let Ok(msg) = rx.try_recv() {
+            if let AgentMessage::Metrics { samples } = msg {
+                metrics.extend(samples);
+            }
+        }
+        // The first sample only primes the CPU rate (the background loop may
+        // add its own samples, so there can be more than one).
+        assert!(!metrics.is_empty(), "{metrics:?}");
+        assert!(metrics
+            .iter()
+            .all(|m| m.deployment_id == id && m.memory_bytes > 0));
     }
 
     #[tokio::test]
@@ -930,7 +1022,7 @@ mod tests {
                     }
                 }
                 AgentMessage::Status(r) => statuses.push(r.status),
-                AgentMessage::Hello { .. } => {}
+                AgentMessage::Hello { .. } | AgentMessage::Metrics { .. } => {}
             }
         }
         assert!(log.starts_with("Cloning\nBuilding\n"), "{log}");
@@ -996,6 +1088,15 @@ mod tests {
             }
         }
         assert!(text.starts_with("Cloning\n") && text.contains("Build failed"));
+    }
+
+    #[test]
+    fn cpu_rate_is_cpu_time_over_wall_time() {
+        let ten = Duration::from_secs(10);
+        assert_eq!(millicores(0, 2_500_000, ten), 250);
+        assert_eq!(millicores(5, 5, ten), 0);
+        assert_eq!(millicores(9, 3, ten), 0, "counter reset");
+        assert_eq!(millicores(0, 5, Duration::ZERO), 0);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 "use client";
 
-import { useRouter, useSearchParams } from "next/navigation";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import type { Environment, Project } from "@/lib/types";
@@ -9,6 +9,7 @@ import type { Environment, Project } from "@/lib/types";
 export function ProjectCrumb({ projectId }: { projectId: string }) {
   const router = useRouter();
   const params = useSearchParams();
+  const pathname = usePathname();
   const [project, setProject] = useState<Project | null>(null);
   const [envs, setEnvs] = useState<Environment[]>([]);
   const [open, setOpen] = useState(false);
@@ -34,7 +35,8 @@ export function ProjectCrumb({ projectId }: { projectId: string }) {
 
   function pick(id: string) {
     setOpen(false);
-    router.push(`/projects/${projectId}?env=${id}`);
+    // Stay on the current tab (Architecture, Observability or Logs).
+    router.push(`${pathname}?env=${id}`);
   }
 
   async function createEnv(e: React.FormEvent<HTMLFormElement>) {

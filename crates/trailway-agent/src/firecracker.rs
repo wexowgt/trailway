@@ -2,7 +2,7 @@
 
 use crate::image::{make_config_drive, ImageStore};
 use crate::net::{self, HostNet};
-use crate::runtime::{validate_spec, Runtime};
+use crate::runtime::{validate_spec, Runtime, VmStats};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::fs::{self, File};
@@ -167,6 +167,13 @@ impl Runtime for FirecrackerRuntime {
             _ => VmState::Stopped,
         };
         Ok(info)
+    }
+
+    fn stats(&self, id: &str) -> Result<VmStats> {
+        let pid = self.pid(id).context("vm has no process")?;
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+        let statm = fs::read_to_string(format!("/proc/{pid}/statm"))?;
+        parse_proc_stats(&stat, &statm).context("could not read the VM process stats")
     }
 
     fn prepare(&self, spec: &VmSpec) -> Result<()> {
@@ -339,6 +346,26 @@ fn wait_for_socket(sock: &Path) -> Result<()> {
     bail!("firecracker API socket {} did not appear", sock.display())
 }
 
+/// Linux reports CPU time in clock ticks of 1/100 s and memory in pages.
+const MICROS_PER_TICK: u64 = 10_000;
+const PAGE_BYTES: u64 = 4096;
+
+/// CPU time (user + system) and resident memory from `/proc/<pid>/stat` and
+/// `/proc/<pid>/statm`. The process name in `stat` may hold spaces, so fields
+/// are counted from the closing parenthesis.
+pub fn parse_proc_stats(stat: &str, statm: &str) -> Option<VmStats> {
+    let rest = stat.rsplit_once(')')?.1;
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    // After the name: state is field 3, utime 14, stime 15.
+    let utime: u64 = fields.get(11)?.parse().ok()?;
+    let stime: u64 = fields.get(12)?.parse().ok()?;
+    let resident: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+    Some(VmStats {
+        cpu_micros: (utime + stime) * MICROS_PER_TICK,
+        memory_bytes: resident * PAGE_BYTES,
+    })
+}
+
 fn alive(pid: u32) -> bool {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
     // Field 3 is the state; a zombie has exited.
@@ -456,6 +483,16 @@ mod tests {
         r.read_to_string(&mut out).unwrap();
         assert_eq!(out, "hello\n");
         let _ = fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn parses_proc_stats_with_spaces_in_the_name() {
+        let stat =
+            "42 (firecracker vm) S 1 42 42 0 -1 4194560 100 0 0 0 150 50 0 0 20 0 5 0 1000 1 2";
+        let s = parse_proc_stats(stat, "9000 2560 100 1 0 300 0").unwrap();
+        assert_eq!(s.cpu_micros, 200 * 10_000);
+        assert_eq!(s.memory_bytes, 2560 * 4096);
+        assert!(parse_proc_stats("garbage", "1 2").is_none());
     }
 
     #[test]

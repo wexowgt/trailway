@@ -58,3 +58,33 @@ export type Deployment = {
   created_at: string;
   updated_at: string;
 };
+
+export type MetricPoint = { ts: string; cpu_millicores: number; memory_bytes: number };
+export type ServiceSeries = {
+  service_id: string;
+  name: string;
+  cpu_limit_millicores: number;
+  memory_limit_bytes: number;
+  points: MetricPoint[];
+};
+export type EnvironmentMetrics = {
+  from: string;
+  to: string;
+  bucket_secs: number;
+  services: ServiceSeries[];
+};
+export type MetricsRange = "1h" | "24h" | "7d";
+
+export type LogChunk = { id: number; ts: string; service_id: string; service: string; text: string };
+export type EnvironmentLogs = { chunks: LogChunk[]; next_after: number };
+
+// Ledger compute is in seconds (vCPU-seconds and GB-seconds), never mixed.
+export type Compute = { vcpu_seconds: number; gb_seconds: number };
+export type LedgerBalance = { contributed: Compute; consumed: Compute; balance: Compute };
+export type ServerLedger = {
+  server_id: string;
+  hostname: string | null;
+  contributed: Compute;
+  consumed: Compute;
+  balance: Compute;
+};

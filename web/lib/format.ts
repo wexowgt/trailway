@@ -32,3 +32,10 @@ export function timeAgo(iso: string | null, now = Date.now()): string {
 export function installCommand(origin: string, secret: string): string {
   return `curl -fsSL ${origin}/install.sh | sudo sh -s -- --key ${secret} --api ${origin}`;
 }
+
+const SECONDS_PER_HOUR = 3600;
+
+/** Ledger seconds as hours, for readability: "12.50". */
+export function formatHours(seconds: number): string {
+  return (seconds / SECONDS_PER_HOUR).toFixed(2);
+}
