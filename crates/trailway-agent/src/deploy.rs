@@ -15,14 +15,21 @@ use trailway_proto::{
 };
 use uuid::Uuid;
 
-use crate::runtime::Runtime;
+use crate::{
+    proxy::{Proxy, Route},
+    runtime::Runtime,
+};
 
 /// Finished deployments kept in the record (oldest dropped first).
 const KEEP_FINISHED: usize = 100;
 const LOG_CHUNK: usize = 64 * 1024;
 const LOG_POLL: Duration = Duration::from_millis(500);
+/// How often the proxy is made to match the running deployments again (Caddy
+/// may have restarted, or been missing when a deploy finished).
+const ROUTE_SYNC_INTERVAL: Duration = Duration::from_secs(30);
 
 pub type SharedRuntime = Arc<dyn Runtime + Send + Sync>;
+pub type SharedProxy = Arc<dyn Proxy + Send + Sync>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Entry {
@@ -32,6 +39,9 @@ struct Entry {
     vm_id: Option<String>,
     host_port: Option<u16>,
     error: Option<String>,
+    /// Public host name routed to `host_port` while running.
+    #[serde(default)]
+    domain: Option<String>,
 }
 
 impl Entry {
@@ -59,6 +69,9 @@ impl Entry {
 
 pub struct Manager {
     rt: SharedRuntime,
+    proxy: SharedProxy,
+    /// The last proxy error, so a Caddy that stays down is logged once.
+    proxy_error: Mutex<Option<String>>,
     path: Option<PathBuf>,
     entries: Mutex<Vec<Entry>>,
     /// The live API connection, if any. Messages sent while there is none are
@@ -70,7 +83,7 @@ pub struct Manager {
 impl Manager {
     /// Loads the record from `path` (when given) and starts the job worker.
     /// Must be called inside a tokio runtime.
-    pub fn new(rt: SharedRuntime, path: Option<PathBuf>) -> Arc<Self> {
+    pub fn new(rt: SharedRuntime, proxy: SharedProxy, path: Option<PathBuf>) -> Arc<Self> {
         let mut entries: Vec<Entry> = path
             .as_ref()
             .and_then(|p| std::fs::read(p).ok())
@@ -87,6 +100,8 @@ impl Manager {
         let (jobs, rx) = unbounded_channel();
         let manager = Arc::new(Self {
             rt,
+            proxy,
+            proxy_error: Mutex::new(None),
             path,
             entries: Mutex::new(entries),
             sink: Mutex::new(None),
@@ -94,6 +109,7 @@ impl Manager {
         });
         manager.persist();
         tokio::spawn(worker(manager.clone(), rx));
+        tokio::spawn(route_sync(manager.clone()));
         manager
     }
 
@@ -112,6 +128,7 @@ impl Manager {
                 vm_id: None,
                 host_port: None,
                 error: None,
+                domain: job.domain.clone(),
             });
         }
         let _ = self.jobs.send(msg);
@@ -121,6 +138,8 @@ impl Manager {
     /// every deployment, then streams the logs of the running ones.
     pub fn attach(self: &Arc<Self>, sink: UnboundedSender<AgentMessage>) {
         self.refresh();
+        let manager = self.clone();
+        tokio::task::spawn_blocking(move || manager.sync_routes());
         let _ = sink.send(AgentMessage::Hello {
             deployments: self.reports(),
         });
@@ -139,6 +158,37 @@ impl Manager {
 
     pub fn detach(&self) {
         *self.sink.lock().unwrap() = None;
+    }
+
+    /// Makes the proxy serve the running deployments that have a domain and a
+    /// forwarded port, and nothing else.
+    pub fn sync_routes(&self) {
+        let mut routes: Vec<Route> = vec![];
+        for e in self.entries() {
+            let (DeploymentStatus::Running, Some(domain), Some(port)) =
+                (e.status, e.domain, e.host_port)
+            else {
+                continue;
+            };
+            let route = Route {
+                key: e.service_id.to_string(),
+                domain,
+                port,
+            };
+            routes.retain(|r| r.key != route.key);
+            routes.push(route);
+        }
+        let result = self.proxy.sync(&routes).map_err(|e| format!("{e:#}"));
+        let mut last = self.proxy_error.lock().unwrap();
+        match result {
+            Ok(()) => *last = None,
+            Err(e) => {
+                if last.as_ref() != Some(&e) {
+                    tracing::warn!("could not update the public routes: {e}");
+                }
+                *last = Some(e);
+            }
+        }
     }
 
     /// Marks running deployments whose VM is gone as failed.
@@ -240,6 +290,7 @@ impl Manager {
             ApiMessage::Deploy(job) => self.run_deploy(&job),
             ApiMessage::Stop { deployment_id } => self.run_stop(deployment_id),
         }
+        self.sync_routes();
     }
 
     fn run_deploy(&self, job: &DeployJob) {
@@ -328,6 +379,19 @@ impl Manager {
     }
 }
 
+/// Keeps the proxy matching the running deployments.
+async fn route_sync(manager: Arc<Manager>) {
+    let mut ticker = tokio::time::interval(ROUTE_SYNC_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        let m = manager.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || m.sync_routes()).await {
+            tracing::error!("route sync panicked: {e}");
+        }
+    }
+}
+
 async fn worker(manager: Arc<Manager>, mut rx: UnboundedReceiver<ApiMessage>) {
     while let Some(msg) = rx.recv().await {
         let m = manager.clone();
@@ -407,7 +471,10 @@ async fn follow_logs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::{FakeRuntime, FAIL_IMAGE_PREFIX};
+    use crate::{
+        proxy::RecordingProxy,
+        runtime::{FakeRuntime, FAIL_IMAGE_PREFIX},
+    };
     use trailway_proto::VmSpec;
 
     fn spec(image: &str) -> VmSpec {
@@ -427,11 +494,26 @@ mod tests {
             deployment_id: Uuid::new_v4(),
             service_id: service,
             spec: spec(image),
+            domain: None,
         }
     }
 
     fn manager(rt: Arc<FakeRuntime>, path: Option<PathBuf>) -> Arc<Manager> {
-        Manager::new(rt, path)
+        Manager::new(rt, Arc::new(RecordingProxy::default()), path)
+    }
+
+    fn routed_manager(proxy: Arc<RecordingProxy>) -> Arc<Manager> {
+        Manager::new(Arc::new(FakeRuntime::default()), proxy, None)
+    }
+
+    fn routes(proxy: &RecordingProxy) -> Vec<(String, u16)> {
+        proxy
+            .routes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| (r.domain.clone(), r.port))
+            .collect()
     }
 
     fn statuses(m: &Manager) -> Vec<(Uuid, DeploymentStatus)> {
@@ -508,6 +590,53 @@ mod tests {
                 DeploymentStatus::Running
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn running_service_is_routed_and_stop_removes_the_route() {
+        let proxy = Arc::new(RecordingProxy::default());
+        let m = routed_manager(proxy.clone());
+        let service = Uuid::new_v4();
+        let domain = "hello-production.1-2-3-4.sslip.io".to_string();
+
+        let mut first = job(service, "nginxdemos/hello");
+        first.domain = Some(domain.clone());
+        m.submit(ApiMessage::Deploy(first.clone()));
+        settle(&m).await;
+        assert_eq!(routes(&proxy), [(domain.clone(), 30000)]);
+
+        // A redeploy keeps the domain and follows the new VM's port.
+        let mut second = job(service, "nginxdemos/hello");
+        second.domain = Some(domain.clone());
+        m.submit(ApiMessage::Deploy(second.clone()));
+        settle(&m).await;
+        assert_eq!(routes(&proxy), [(domain, 30001)]);
+
+        m.submit(ApiMessage::Stop {
+            deployment_id: second.deployment_id,
+        });
+        for _ in 0..200 {
+            if routes(&proxy).is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("route was not removed");
+    }
+
+    #[tokio::test]
+    async fn services_without_domain_or_port_get_no_route() {
+        let proxy = Arc::new(RecordingProxy::default());
+        let m = routed_manager(proxy.clone());
+        let no_domain = job(Uuid::new_v4(), "nginx");
+        let mut no_port = job(Uuid::new_v4(), "worker");
+        no_port.domain = Some("worker.example.com".into());
+        no_port.spec.port = None;
+        m.submit(ApiMessage::Deploy(no_domain));
+        m.submit(ApiMessage::Deploy(no_port));
+        settle(&m).await;
+        m.sync_routes();
+        assert!(routes(&proxy).is_empty());
     }
 
     #[tokio::test]

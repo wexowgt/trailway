@@ -30,6 +30,33 @@ pub fn machine_id() -> anyhow::Result<String> {
     anyhow::bail!("no machine id found in {MACHINE_ID_PATHS:?}")
 }
 
+const PUBLIC_IP_URL: &str = "https://api.ipify.org";
+
+/// Parses an address the way the API wants it: a plain IP, nothing else.
+pub fn parse_ip(text: &str) -> Option<String> {
+    text.trim()
+        .parse::<std::net::IpAddr>()
+        .ok()
+        .map(|ip| ip.to_string())
+}
+
+/// The host's public IP: `TRAILWAY_PUBLIC_IP` when set, otherwise what an
+/// outside service sees. `None` when it cannot be found right now.
+pub async fn public_ip(http: &reqwest::Client) -> Option<String> {
+    if let Ok(ip) = std::env::var("TRAILWAY_PUBLIC_IP") {
+        return parse_ip(&ip);
+    }
+    let body = http
+        .get(PUBLIC_IP_URL)
+        .send()
+        .await
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+    parse_ip(&body)
+}
+
 pub fn register_request() -> anyhow::Result<RegisterRequest> {
     Ok(RegisterRequest {
         machine_id: machine_id()?,
@@ -89,6 +116,7 @@ impl Sampler {
             },
             disk: disk_resource(&disks),
             kvm: Path::new(KVM_DEVICE).exists() || fake_runtime(),
+            public_ip: None,
         }
     }
 }
@@ -96,6 +124,16 @@ impl Sampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_only_plain_ips() {
+        assert_eq!(
+            parse_ip(" 178.104.208.91\n").as_deref(),
+            Some("178.104.208.91")
+        );
+        assert_eq!(parse_ip("<html>"), None);
+        assert_eq!(parse_ip(""), None);
+    }
 
     #[test]
     fn cpu_millicores() {

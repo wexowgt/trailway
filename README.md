@@ -60,6 +60,14 @@ GET  /api/v1/deployments/{id}/logs[?follow=true]     console output as text
 
 The agent keeps one outbound WebSocket (`GET /api/v1/agent/ws`, server token) so it works behind NAT. The API sends `deploy` and `stop` jobs; the agent reports `queued`, `building` (image pull), `deploying`, `running` (with the forwarded host port), `failed` or `stopped`, and streams the console log in chunks keyed by byte offset. After every (re)connect the agent sends `hello` with the actual state of each deployment it knows (kept in `deployments.json` next to `state.json`) and the API reconciles: lost jobs are handed over again, VMs that are gone are marked failed, unwanted ones are stopped. Types are in `crates/trailway-proto`. `TRAILWAY_FAKE_RUNTIME=1` runs the agent with simulated VMs (no KVM needed) for local development.
 
+### Public HTTPS URL
+
+A service with a `port` gets `url` in the service API, like `https://hello-production.178-104-208-91.sslip.io` (`<service>-<environment>.<server ip with dashes>.sslip.io`). The label is fixed when the service is created, so redeploys and renames keep the URL; a second service with the same label on a server gets a short id suffix. The agent reports its public IP in every heartbeat (`TRAILWAY_PUBLIC_IP` overrides the lookup), so the URL appears once the server has sent one.
+
+Each host runs Caddy (installed by the installer and `scripts/setup-host.sh`; ports 80 and 443 must be open). The agent owns one Caddy HTTP server and keeps a route per running service in it through Caddy's admin API (`127.0.0.1:2019`, `TRAILWAY_CADDY_ADMIN`): the route points at the VM's forwarded host port, is swapped in place on redeploy and removed on stop. Caddy gets the Let's Encrypt certificate on its own and proxies HTTP and WebSockets. The routes are re-synced every 30 s, so a Caddy restart heals itself. `TRAILWAY_PROXY=off` disables this (development without Caddy).
+
+The API's `API_DOMAIN_BASE` (default `{ip}.sslip.io`, `{ip}` being the dashed server IP) sets the domain: use a wildcard domain such as `apps.example.com` with `*.apps.example.com` pointing at the servers once there is one.
+
 ## Checks (same as CI)
 
 ```sh

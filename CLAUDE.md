@@ -22,6 +22,10 @@ Railway-like deploy platform on a shared server pool. See README.md for the prod
 - `web/middleware.ts` redirects to `/login` without a session cookie; `web/app/(app)/layout.tsx` validates it with `GET /api/v1/me`.
 - Servers page polls `/servers` every 5s. Local run: Postgres, `cargo run -p trailway-api`, `cd web && pnpm dev`.
 
+## Public URLs
+
+- `crates/trailway-agent/src/proxy.rs` keeps Caddy routes (admin API) in sync with running deployments; `deploy::Manager::sync_routes` derives them. The API computes the domain (`crates/trailway-api/src/domains.rs`, base from `API_DOMAIN_BASE`) and sends it in the deploy job; `services.host_label` keeps the URL stable.
+
 ## Conventions
 
 - CI (`.github/workflows/ci.yml`) must stay green: fmt, clippy `-D warnings`, tests, web lint and build.

@@ -84,9 +84,10 @@ async fn owned_environment(
     .ok_or(ApiError::NotFound)
 }
 
-/// The environment must exist and belong to `user`; used by the service routes.
-pub async fn require_environment(pool: &PgPool, user: Uuid, id: Uuid) -> Result<(), ApiError> {
-    owned_environment(pool, user, id).await.map(|_| ())
+/// The environment must exist and belong to `user`; used by the service
+/// routes. Returns its name.
+pub async fn require_environment(pool: &PgPool, user: Uuid, id: Uuid) -> Result<String, ApiError> {
+    owned_environment(pool, user, id).await.map(|e| e.name)
 }
 
 pub async fn create(

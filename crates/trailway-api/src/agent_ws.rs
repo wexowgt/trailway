@@ -150,7 +150,14 @@ async fn store_logs(
     tx.commit().await
 }
 
-type Pending = (Uuid, Option<Uuid>, String, String, Jsonb<VmSpec>);
+type Pending = (
+    Uuid,
+    Option<Uuid>,
+    String,
+    String,
+    Jsonb<VmSpec>,
+    Option<String>,
+);
 
 /// Makes the database and the agent agree after a (re)connect: the agent's
 /// report wins for what is running, the database decides what should be.
@@ -166,13 +173,13 @@ async fn reconcile(
         reports.iter().map(|r| (r.deployment_id, r)).collect();
 
     let rows: Vec<Pending> = sqlx::query_as(
-        "SELECT id, service_id, status, desired, spec FROM deployments \
+        "SELECT id, service_id, status, desired, spec, domain FROM deployments \
          WHERE server_id = $1 AND status NOT IN ('failed', 'stopped')",
     )
     .bind(server_id)
     .fetch_all(&state.pool)
     .await?;
-    for (id, service_id, status, desired, spec) in &rows {
+    for (id, service_id, status, desired, spec, domain) in &rows {
         let report = reported.get(id);
         if desired == "stopped" {
             match report {
@@ -197,6 +204,7 @@ async fn reconcile(
                         deployment_id: *id,
                         service_id: service_id.unwrap_or(*id),
                         spec: spec.0.clone(),
+                        domain: domain.clone(),
                     }),
                 );
             }
