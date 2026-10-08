@@ -1,3 +1,10 @@
+mod client;
+mod config;
+mod daemon;
+mod host;
+
+use std::path::PathBuf;
+
 use anyhow::{bail, Result};
 use clap::{Args, Parser, Subcommand};
 use std::io::{self, Read, Write};
@@ -14,6 +21,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Register with the server key and send heartbeats (run by systemd).
+    Run {
+        #[arg(long, default_value = "/etc/trailway/agent.json")]
+        config: PathBuf,
+        #[arg(long, default_value = "/var/lib/trailway/state.json")]
+        state: PathBuf,
+    },
     /// Manage microVMs by hand (for testing).
     #[command(subcommand)]
     Vm(VmCommand),
@@ -69,7 +83,10 @@ fn parse_env(s: &str) -> Result<(String, String), String> {
 }
 
 fn main() -> Result<()> {
-    let Command::Vm(cmd) = Cli::parse().command;
+    let cmd = match Cli::parse().command {
+        Command::Run { config, state } => return daemon::run(&config, &state),
+        Command::Vm(cmd) => cmd,
+    };
     if !cfg!(target_os = "linux") {
         bail!("vm commands need Linux with KVM");
     }
