@@ -9,7 +9,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use sqlx::{types::Json as Jsonb, PgPool};
-use trailway_proto::{CreateService, Service, UpdateService};
+use trailway_proto::{CreateService, GitSource, Service, UpdateService};
 use uuid::Uuid;
 
 use crate::{
@@ -34,7 +34,9 @@ pub struct ServiceRow {
     pub id: Uuid,
     pub environment_id: Uuid,
     pub name: String,
-    pub image: String,
+    pub image: Option<String>,
+    pub git_url: Option<String>,
+    pub git_branch: Option<String>,
     pub vcpus: i32,
     pub memory_mib: i32,
     pub env: Jsonb<BTreeMap<String, String>>,
@@ -66,6 +68,7 @@ impl From<ServiceRow> for Service {
             environment_id: r.environment_id,
             name: r.name,
             image: r.image,
+            git: git_of(r.git_url, r.git_branch),
             vcpus: r.vcpus as u8,
             memory_mib: r.memory_mib as u32,
             env: r.env.0,
@@ -78,8 +81,15 @@ impl From<ServiceRow> for Service {
     }
 }
 
-const COLS: &str = "s.id, s.environment_id, s.name, s.image, s.vcpus, s.memory_mib, s.env, \
-                    s.port, s.server_id, s.host_label, \
+pub fn git_of(url: Option<String>, branch: Option<String>) -> Option<GitSource> {
+    Some(GitSource {
+        url: url?,
+        branch: branch?,
+    })
+}
+
+const COLS: &str = "s.id, s.environment_id, s.name, s.image, s.git_url, s.git_branch, s.vcpus, \
+                    s.memory_mib, s.env, s.port, s.server_id, s.host_label, \
                     (SELECT public_ip FROM servers WHERE id = s.server_id) AS public_ip, \
                     s.created_at, s.updated_at";
 
@@ -107,6 +117,15 @@ fn check_image(image: &str) -> Result<String, ApiError> {
         return Err(ApiError::validation("image is not valid"));
     }
     Ok(image.to_string())
+}
+
+fn check_git(git: &GitSource) -> Result<GitSource, ApiError> {
+    let git = GitSource {
+        url: git.url.trim().to_string(),
+        branch: git.branch.trim().to_string(),
+    };
+    git.validate().map_err(ApiError::validation)?;
+    Ok(git)
 }
 
 fn check_vcpus(vcpus: u8) -> Result<i32, ApiError> {
@@ -196,7 +215,11 @@ pub async fn create(
     ApiJson(body): ApiJson<CreateService>,
 ) -> Result<(StatusCode, Json<Service>), ApiError> {
     let name = check_text("name", &body.name)?;
-    let image = check_image(&body.image)?;
+    let (image, git) = match (&body.image, &body.git) {
+        (Some(image), None) => (Some(check_image(image)?), None),
+        (None, Some(git)) => (None, Some(check_git(git)?)),
+        _ => return Err(ApiError::validation("give exactly one of image and git")),
+    };
     let vcpus = check_vcpus(body.vcpus.unwrap_or(DEFAULT_VCPUS))?;
     let memory = check_memory(body.memory_mib.unwrap_or(DEFAULT_MEMORY_MIB))?;
     let port = body.port.map(check_port).transpose()?;
@@ -207,13 +230,16 @@ pub async fn create(
     let id = Uuid::new_v4();
     let label = free_label(&state.pool, body.server_id, id, &name, &environment).await?;
     sqlx::query(
-        "INSERT INTO services (id, environment_id, name, image, vcpus, memory_mib, env, port, \
-         server_id, host_label) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+        "INSERT INTO services (id, environment_id, name, image, git_url, git_branch, vcpus, \
+         memory_mib, env, port, server_id, host_label) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
     )
     .bind(id)
     .bind(environment_id)
     .bind(&name)
     .bind(&image)
+    .bind(git.as_ref().map(|g| &g.url))
+    .bind(git.as_ref().map(|g| &g.branch))
     .bind(vcpus)
     .bind(memory)
     .bind(Jsonb(&body.env))
@@ -272,7 +298,11 @@ pub async fn update(
         .as_deref()
         .map(|n| check_text("name", n))
         .transpose()?;
+    if body.image.is_some() && body.git.is_some() {
+        return Err(ApiError::validation("give only one of image and git"));
+    }
     let image = body.image.as_deref().map(check_image).transpose()?;
+    let git = body.git.as_ref().map(check_git).transpose()?;
     let vcpus = body.vcpus.map(check_vcpus).transpose()?;
     let memory = body.memory_mib.map(check_memory).transpose()?;
     let port = body.port.map(check_port).transpose()?;
@@ -306,7 +336,10 @@ pub async fn update(
     }
 
     let id: Uuid = sqlx::query_scalar(
-        "UPDATE services SET name = COALESCE($2, name), image = COALESCE($3, image), \
+        "UPDATE services SET name = COALESCE($2, name), \
+         image = CASE WHEN $10::text IS NOT NULL THEN NULL ELSE COALESCE($3, image) END, \
+         git_url = CASE WHEN $3::text IS NOT NULL THEN NULL ELSE COALESCE($10, git_url) END, \
+         git_branch = CASE WHEN $3::text IS NOT NULL THEN NULL ELSE COALESCE($11, git_branch) END, \
          vcpus = COALESCE($4, vcpus), memory_mib = COALESCE($5, memory_mib), \
          env = COALESCE($6, env), port = COALESCE($7, port), \
          server_id = COALESCE($8, server_id), host_label = COALESCE($9, host_label), \
@@ -321,6 +354,8 @@ pub async fn update(
     .bind(port)
     .bind(body.server_id)
     .bind(label)
+    .bind(git.as_ref().map(|g| g.url.clone()))
+    .bind(git.as_ref().map(|g| g.branch.clone()))
     .fetch_one(&state.pool)
     .await
     .map_err(|e| conflict_on_unique(e, NAME_TAKEN))?;

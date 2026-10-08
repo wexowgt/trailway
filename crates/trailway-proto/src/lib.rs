@@ -344,13 +344,60 @@ pub const MILLICORES_PER_VCPU: u64 = 1000;
 /// Path of the agent WebSocket (`GET`, `Authorization: Bearer tw_st_...`).
 pub const AGENT_WS_PATH: &str = "/api/v1/agent/ws";
 
+/// A public git repository and branch to build an image from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitSource {
+    /// `https://` URL of a public repository.
+    pub url: String,
+    pub branch: String,
+}
+
+impl GitSource {
+    /// The agent passes both to `git`, so anything but a plain https URL and a
+    /// plain branch name is refused.
+    pub fn validate(&self) -> Result<(), String> {
+        let url = &self.url;
+        let rest = url
+            .strip_prefix("https://")
+            .ok_or("git url must start with https://")?;
+        let host = rest.split('/').next().unwrap_or_default();
+        if url.len() > 255
+            || host.is_empty()
+            || !rest.contains('/')
+            || host.contains(['@', '\\'])
+            || url.chars().any(|c| c.is_whitespace() || c.is_control())
+            || url.contains(['\'', '"', '`', '$', '\\', '#', '?'])
+        {
+            return Err("git url is not valid".into());
+        }
+        let b = &self.branch;
+        if b.is_empty()
+            || b.len() > 255
+            || b.starts_with(['-', '/'])
+            || b.ends_with(['/', '.'])
+            || b.contains("..")
+            || b.contains("//")
+            || b.contains("@{")
+            || b.ends_with(".lock")
+            || b.chars()
+                .any(|c| c.is_whitespace() || c.is_control() || "~^:?*[\\".contains(c))
+        {
+            return Err("git branch is not valid".into());
+        }
+        Ok(())
+    }
+}
+
 /// A deploy job: run `spec` for `service_id`, replacing the VM that service
-/// currently has on this server.
+/// currently has on this server. With a `source` the agent first builds the
+/// image from the repository and runs that instead of `spec.image`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeployJob {
     pub deployment_id: Uuid,
     pub service_id: Uuid,
     pub spec: VmSpec,
+    #[serde(default)]
+    pub source: Option<GitSource>,
     /// Public host name to route to the VM's forwarded port over HTTPS.
     #[serde(default)]
     pub domain: Option<String>,
@@ -379,6 +426,9 @@ pub struct DeploymentReport {
     /// Why a deployment failed.
     #[serde(default)]
     pub error: Option<String>,
+    /// Commit a git deployment was built from, once known.
+    #[serde(default)]
+    pub commit: Option<String>,
 }
 
 /// Messages from the agent to the API over the WebSocket.
@@ -428,8 +478,14 @@ pub struct Environment {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateService {
     pub name: String,
-    /// OCI image reference, e.g. `nginxdemos/hello`.
-    pub image: String,
+    /// OCI image reference, e.g. `nginxdemos/hello`. Exactly one of `image`
+    /// and `git` is given.
+    #[serde(default)]
+    pub image: Option<String>,
+    /// Build from a public git repository instead (Dockerfile if the repo has
+    /// one, else Nixpacks).
+    #[serde(default)]
+    pub git: Option<GitSource>,
     #[serde(default)]
     pub vcpus: Option<u8>,
     #[serde(default)]
@@ -451,6 +507,9 @@ pub struct UpdateService {
     pub name: Option<String>,
     #[serde(default)]
     pub image: Option<String>,
+    /// Switches the service to a git source (and drops its image).
+    #[serde(default)]
+    pub git: Option<GitSource>,
     #[serde(default)]
     pub vcpus: Option<u8>,
     #[serde(default)]
@@ -468,7 +527,8 @@ pub struct Service {
     pub id: Uuid,
     pub environment_id: Uuid,
     pub name: String,
-    pub image: String,
+    pub image: Option<String>,
+    pub git: Option<GitSource>,
     pub vcpus: u8,
     pub memory_mib: u32,
     pub env: BTreeMap<String, String>,
@@ -488,7 +548,11 @@ pub struct Deployment {
     pub service_id: Option<Uuid>,
     pub server_id: Uuid,
     pub status: DeploymentStatus,
+    /// Empty for a git deployment until its image is built.
     pub image: String,
+    pub git: Option<GitSource>,
+    /// Commit a git deployment was built from.
+    pub commit: Option<String>,
     pub vcpus: u8,
     pub memory_mib: u32,
     /// Port on the server that forwards to the app port, once running.
@@ -556,6 +620,7 @@ mod tests {
             vm_id: Some("vm".into()),
             host_port: Some(20000),
             error: None,
+            commit: None,
         });
         let json = serde_json::to_value(&m).unwrap();
         assert_eq!(json["type"], "status");
@@ -576,6 +641,34 @@ mod tests {
             assert_eq!(DeploymentStatus::parse(s.as_str()), Some(s));
         }
         assert!(DeploymentStatus::parse("nope").is_none());
+    }
+
+    #[test]
+    fn git_source_validation() {
+        let g = |url: &str, branch: &str| GitSource {
+            url: url.into(),
+            branch: branch.into(),
+        };
+        assert!(g("https://github.com/o/r", "main").validate().is_ok());
+        assert!(g("https://github.com/o/r.git", "feat/x-1")
+            .validate()
+            .is_ok());
+        for url in [
+            "http://github.com/o/r",
+            "git://github.com/o/r",
+            "https://u:p@github.com/o/r",
+            "https://github.com",
+            "https://github.com/o/r --upload-pack=x",
+            "https://github.com/o/r?x=1",
+            "-https://github.com/o/r",
+        ] {
+            assert!(g(url, "main").validate().is_err(), "{url}");
+        }
+        for b in [
+            "", "-x", "a..b", "a b", "a:b", "x/", "a.lock", "a@{1}", "a\\b",
+        ] {
+            assert!(g("https://github.com/o/r", b).validate().is_err(), "{b}");
+        }
     }
 
     #[test]

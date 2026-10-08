@@ -3,6 +3,7 @@
 //! Uses `skopeo` (pull), `umoci` (unpack layers) and `mkfs.ext4 -d` (build).
 //! `scripts/setup-host.sh` installs them.
 
+use crate::build::DAEMON_PREFIX;
 use crate::init::{init_script, run_script, BUSYBOX_PATH, INIT_PATH};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -76,10 +77,15 @@ impl ImageStore {
         let oci = out.join("oci");
         let bundle = out.join("bundle");
         // Pin the pull to the digest we resolved so the cache key is truthful.
-        let pinned = pinned_reference(image, digest);
+        // A locally built image is already fixed by its id.
+        let source = if image.starts_with(DAEMON_PREFIX) {
+            image.to_string()
+        } else {
+            format!("docker://{}", pinned_reference(image, digest))
+        };
         run(Command::new("skopeo")
             .arg("copy")
-            .arg(format!("docker://{pinned}"))
+            .arg(source)
             .arg(format!("oci:{}:img", oci.display())))?;
         run(Command::new("umoci")
             .args(["unpack", "--image"])
@@ -137,6 +143,23 @@ pub fn pinned_reference(image: &str, digest: &str) -> String {
 }
 
 fn resolve_digest(image: &str) -> Result<String> {
+    if let Some(local) = image.strip_prefix(DAEMON_PREFIX) {
+        let out = Command::new("docker")
+            .args(["image", "inspect", "--format", "{{.Id}}", local])
+            .output()
+            .context("running docker (is it installed? see scripts/setup-host.sh)")?;
+        if !out.status.success() {
+            bail!(
+                "docker image inspect {local} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        let id = String::from_utf8(out.stdout)?.trim().to_string();
+        if !id.starts_with("sha256:") {
+            bail!("unexpected image id {id:?} for {local}");
+        }
+        return Ok(id);
+    }
     let out = Command::new("skopeo")
         .args(["inspect", "--format", "{{.Digest}}"])
         .arg(format!("docker://{image}"))

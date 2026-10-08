@@ -5,7 +5,8 @@ use std::{
 };
 
 use trailway_agent::{
-    deploy::{Manager, SharedProxy, SharedRuntime},
+    build::{DockerBuilder, FakeBuilder},
+    deploy::{Manager, SharedBuilder, SharedProxy, SharedRuntime},
     firecracker::{Config as FcConfig, FirecrackerRuntime},
     proxy::{CaddyProxy, NoProxy},
     runtime::FakeRuntime,
@@ -166,6 +167,13 @@ fn runtime() -> SharedRuntime {
     Arc::new(FirecrackerRuntime::new(FcConfig::from_env()))
 }
 
+fn builder(work_dir: PathBuf) -> SharedBuilder {
+    if host::fake_runtime() {
+        return Arc::new(FakeBuilder::default());
+    }
+    Arc::new(DockerBuilder::new(work_dir))
+}
+
 /// Public routes go through the Caddy this host runs. `TRAILWAY_PROXY=off`
 /// turns them off (development without Caddy).
 fn proxy() -> SharedProxy {
@@ -183,7 +191,8 @@ async fn run_loop(config_path: &Path, state_path: &Path) -> anyhow::Result<()> {
         None => register(&client, &config, state_path).await,
     };
     let record = state_path.with_file_name("deployments.json");
-    let manager = Manager::new(runtime(), proxy(), Some(record));
+    let builds = state_path.with_file_name("builds");
+    let manager = Manager::new(runtime(), builder(builds), proxy(), Some(record));
     let shared = Arc::new(Shared {
         client,
         config,

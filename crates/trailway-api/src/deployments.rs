@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use sqlx::{types::Json as Jsonb, PgPool};
 use trailway_proto::{
-    ApiMessage, DeployJob, Deployment, DeploymentStatus, VmSpec, MILLICORES_PER_VCPU,
+    ApiMessage, DeployJob, Deployment, DeploymentStatus, GitSource, VmSpec, MILLICORES_PER_VCPU,
     OFFLINE_AFTER_SECS,
 };
 use uuid::Uuid;
@@ -22,7 +22,7 @@ use crate::{
     auth::AuthUser,
     error::ApiError,
     servers::status_for,
-    services::{owned_service, ServiceRow},
+    services::{git_of, owned_service, ServiceRow},
     AppState,
 };
 
@@ -38,6 +38,8 @@ struct DeploymentRow {
     server_id: Uuid,
     status: String,
     spec: Jsonb<VmSpec>,
+    source: Option<Jsonb<GitSource>>,
+    commit_sha: Option<String>,
     host_port: Option<i32>,
     error: Option<String>,
     created_at: DateTime<Utc>,
@@ -52,6 +54,8 @@ impl From<DeploymentRow> for Deployment {
             server_id: r.server_id,
             status: DeploymentStatus::parse(&r.status).unwrap_or(DeploymentStatus::Failed),
             image: r.spec.0.image,
+            git: r.source.map(|s| s.0),
+            commit: r.commit_sha,
             vcpus: r.spec.0.vcpus,
             memory_mib: r.spec.0.mem_mib,
             host_port: r.host_port.map(|p| p as u16),
@@ -62,7 +66,7 @@ impl From<DeploymentRow> for Deployment {
     }
 }
 
-const COLS: &str = "d.id, d.service_id, d.server_id, d.status, d.spec, d.host_port, d.error, \
+const COLS: &str = "d.id, d.service_id, d.server_id, d.status, d.spec, d.source, d.commit_sha, d.host_port, d.error, \
                     d.created_at, d.updated_at";
 
 async fn owned_deployment(pool: &PgPool, user: Uuid, id: Uuid) -> Result<DeploymentRow, ApiError> {
@@ -136,16 +140,24 @@ pub fn check_fit(free: Free, vcpus: u8, mem_mib: u32, hostname: &str) -> Result<
 }
 
 fn job_spec(service: &ServiceRow) -> VmSpec {
+    let mut env: Vec<(String, String)> = service
+        .env
+        .0
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    // Apps built from source (Nixpacks) listen on $PORT.
+    if let Some(port) = service.port.filter(|_| service.git_url.is_some()) {
+        if !env.iter().any(|(k, _)| k == "PORT") {
+            env.push(("PORT".into(), port.to_string()));
+        }
+    }
     VmSpec {
-        image: service.image.clone(),
+        // Built by the agent for a git service.
+        image: service.image.clone().unwrap_or_default(),
         vcpus: service.vcpus as u8,
         mem_mib: service.memory_mib as u32,
-        env: service
-            .env
-            .0
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect(),
+        env,
         cmd: vec![],
         port: service.port.map(|p| p as u16),
         host_port: None,
@@ -163,6 +175,7 @@ pub async fn deploy(
 ) -> Result<(StatusCode, Json<Deployment>), ApiError> {
     let service = owned_service(&state.pool, user.id, service_id).await?;
     let spec = job_spec(&service);
+    let source = git_of(service.git_url.clone(), service.git_branch.clone());
     let domain = service.domain(&state.config.domain_base);
 
     let mut tx = state.pool.begin().await?;
@@ -213,12 +226,13 @@ pub async fn deploy(
     check_fit(free, spec.vcpus, spec.mem_mib, &hostname)?;
 
     let row: DeploymentRow = sqlx::query_as(&format!(
-        "WITH d AS (INSERT INTO deployments (service_id, server_id, spec, domain) \
-         VALUES ($1, $2, $3, $4) RETURNING *) SELECT {COLS} FROM d"
+        "WITH d AS (INSERT INTO deployments (service_id, server_id, spec, source, domain) \
+         VALUES ($1, $2, $3, $4, $5) RETURNING *) SELECT {COLS} FROM d"
     ))
     .bind(service_id)
     .bind(service.server_id)
     .bind(Jsonb(&spec))
+    .bind(source.as_ref().map(Jsonb))
     .bind(&domain)
     .fetch_one(&mut *tx)
     .await?;
@@ -242,6 +256,7 @@ pub async fn deploy(
             deployment_id: row.id,
             service_id,
             spec,
+            source,
             domain,
         }),
     );
