@@ -14,7 +14,7 @@ export function middleware(req: NextRequest) {
     return NextResponse.redirect(new URL("/login", req.url));
   }
   if (hasSession && isPublic) {
-    return NextResponse.redirect(new URL("/servers", req.url));
+    return NextResponse.redirect(new URL("/projects", req.url));
   }
   return NextResponse.next();
 }
