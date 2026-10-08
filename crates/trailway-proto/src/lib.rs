@@ -86,6 +86,39 @@ pub struct Health {
     pub status: String,
 }
 
+/// What to run in a microVM.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VmSpec {
+    /// OCI image reference, e.g. `nginxdemos/hello` or `ghcr.io/org/app:1.2`.
+    pub image: String,
+    pub vcpus: u8,
+    pub mem_mib: u32,
+    /// Extra environment variables, applied on top of the image's own env.
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
+    /// Overrides the image's entrypoint and cmd when non-empty.
+    #[serde(default)]
+    pub cmd: Vec<String>,
+}
+
+/// Lifecycle state of a microVM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VmState {
+    Running,
+    Stopped,
+}
+
+/// Snapshot of one microVM, as reported by `Runtime::status`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VmInfo {
+    pub id: String,
+    pub spec: VmSpec,
+    pub state: VmState,
+    /// Resolved image digest the rootfs was built from.
+    pub image_digest: String,
+}
+
 /// Body of `POST /api/v1/auth/signup` and `POST /api/v1/auth/login`.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Credentials {
@@ -191,5 +224,12 @@ mod tests {
             token: "tw_st_secret".into(),
         };
         assert!(!format!("{r:?}").contains("secret"));
+    }
+
+    #[test]
+    fn vm_spec_defaults_env_and_cmd() {
+        let spec: VmSpec =
+            serde_json::from_str(r#"{"image":"nginx","vcpus":1,"mem_mib":256}"#).unwrap();
+        assert!(spec.env.is_empty() && spec.cmd.is_empty());
     }
 }
