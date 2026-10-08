@@ -37,6 +37,9 @@ services:
     restart: unless-stopped
     depends_on:
       - api
+    environment:
+      # Read at runtime by the (app) layout to validate the session.
+      API_URL: http://api:8080
     ports:
       - "127.0.0.1:3000:3000"
 
