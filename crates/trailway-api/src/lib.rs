@@ -161,6 +161,7 @@ pub fn router(state: AppState) -> Router {
         );
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/api/healthz", get(healthz))
         .route("/install.sh", get(install_script))
         .route("/downloads/{name}", get(download))
         .nest("/api/v1", v1)
@@ -216,13 +217,15 @@ mod tests {
             .connect_lazy("postgres://localhost/unused")
             .unwrap();
         let state = AppState::new(pool, Config::default());
-        let res = router(state)
-            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(res.status(), 200);
-        let body = res.into_body().collect().await.unwrap().to_bytes();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["status"], "ok");
+        for path in ["/healthz", "/api/healthz"] {
+            let res = router(state.clone())
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(res.status(), 200, "{path}");
+            let body = res.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["status"], "ok");
+        }
     }
 }

@@ -1,0 +1,6 @@
+target
+.git
+.hive
+web/node_modules
+web/.next
+docs

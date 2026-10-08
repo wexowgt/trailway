@@ -1,0 +1,44 @@
+# Production stack on the control plane host. Ports bind to loopback only: the
+# host Caddy terminates HTTPS and proxies to them (see deploy/Caddyfile.tmpl).
+# Images come from GHCR (built by .github/workflows/deploy.yml).
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: trailway
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+      POSTGRES_DB: trailway
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trailway"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    image: ${IMAGE_PREFIX:?set in .env}/trailway-api:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://trailway:${POSTGRES_PASSWORD}@postgres:5432/trailway
+      API_BIND: 0.0.0.0:8080
+      API_COOKIE_SECURE: "true"
+      API_AGENT_DIST_DIR: /opt/dist
+      RUST_LOG: info
+    ports:
+      - "127.0.0.1:8080:8080"
+
+  web:
+    image: ${IMAGE_PREFIX}/trailway-web:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "127.0.0.1:3000:3000"
+
+volumes:
+  pgdata:
