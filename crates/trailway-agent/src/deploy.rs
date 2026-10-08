@@ -950,7 +950,15 @@ mod tests {
         let m = manager(rt.clone(), Some(path.clone()));
         let j = job(Uuid::new_v4(), "nginx");
         m.submit(ApiMessage::Deploy(j.clone()));
-        settle(&m).await;
+        // settle() can return before the spawned deploy has recorded its entry.
+        for _ in 0..200 {
+            if m.entry(j.deployment_id)
+                .is_some_and(|e| e.status == DeploymentStatus::Running)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         m.submit(ApiMessage::Deploy(j.clone()));
         assert_eq!(m.entries().len(), 1);
 
