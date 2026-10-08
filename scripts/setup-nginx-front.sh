@@ -25,7 +25,12 @@ restore() {
 }
 
 command -v certbot >/dev/null 2>&1 || apt-get install -y -qq certbot
-nginx -V 2>&1 | grep -q -- --with-stream || apt-get install -y -qq libnginx-mod-stream
+# stream is a loadable module on Debian/Ubuntu; enable it explicitly because
+# the restore above can wipe the modules-enabled symlink.
+apt-get install -y -qq libnginx-mod-stream
+mkdir -p /etc/nginx/modules-enabled
+ls /etc/nginx/modules-enabled/*stream* >/dev/null 2>&1 \
+  || ln -s /usr/share/nginx/modules-available/mod-stream.conf /etc/nginx/modules-enabled/50-mod-stream.conf
 
 render() {
   sed -e "s/__CONTROL_DOMAIN__/$CONTROL_DOMAIN/g" \
