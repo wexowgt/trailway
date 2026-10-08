@@ -19,12 +19,13 @@ systemctl enable --now docker
 
 mkdir -p "$APP_DIR"
 if [ ! -f "$APP_DIR/.env" ]; then
-  umask 077
+  (umask 077
   cat > "$APP_DIR/.env" <<ENV
 POSTGRES_PASSWORD=$(head -c 24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9')
 IMAGE_PREFIX=ghcr.io/wexowgt
 IMAGE_TAG=latest
 ENV
+  )
 fi
 
 # Backups: nightly at 03:15, last 7 kept.
@@ -36,6 +37,7 @@ CRON
 # Caddy: control plane site plus the agent's server (see Caddyfile.tmpl).
 sed "s/__DOMAIN__/$CONTROL_DOMAIN/" "$DEPLOY_DIR/Caddyfile.tmpl" > /etc/caddy/Caddyfile.new
 caddy validate --config /etc/caddy/Caddyfile.new --adapter caddyfile
+chmod 644 /etc/caddy/Caddyfile.new
 mv /etc/caddy/Caddyfile.new /etc/caddy/Caddyfile
 systemctl reload caddy || systemctl restart caddy
 echo "control plane host ready: $APP_DIR (.env), https://$CONTROL_DOMAIN"
