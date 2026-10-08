@@ -219,6 +219,7 @@ impl Agent {
             vm_id: Some(format!("vm-{id}")),
             host_port,
             error: None,
+            commit: None,
         }))
         .await;
     }
@@ -806,6 +807,7 @@ async fn reconnect_reconciles_with_what_the_agent_reports() {
             vm_id: Some("vm-web".into()),
             host_port: Some(30010),
             error: None,
+            commit: None,
         }])
         .await;
     let ApiMessage::Deploy(again) = agent.next().await else {
@@ -827,6 +829,7 @@ async fn reconnect_reconciles_with_what_the_agent_reports() {
             vm_id: None,
             host_port: None,
             error: Some("image pull failed".into()),
+            commit: None,
         }])
         .await;
     let d = wait_status(&app, &cookie, &queued, "failed").await;
@@ -848,6 +851,7 @@ async fn reconnect_reconciles_with_what_the_agent_reports() {
             vm_id: Some("vm-ghost".into()),
             host_port: None,
             error: None,
+            commit: None,
         }])
         .await;
     assert_eq!(
@@ -856,4 +860,128 @@ async fn reconnect_reconciles_with_what_the_agent_reports() {
             deployment_id: ghost
         }
     );
+}
+
+#[tokio::test]
+async fn git_service_builds_and_a_failed_build_keeps_the_previous_version() {
+    let Some((app, _)) = setup().await else {
+        return;
+    };
+    let addr = serve(&app).await;
+    let cookie = signup(&app).await;
+    let (server, token) = add_server(&app, &cookie, 4000, 8 * GIB).await;
+    let stack = new_stack(&app, &cookie).await;
+
+    // Exactly one source, and the git source must be a plain https repo.
+    let path = format!("/api/v1/environments/{}/services", stack.env_id);
+    for body in [
+        json!({"name": "a", "server_id": server}),
+        json!({"name": "a", "image": "x", "git": {"url": "https://github.com/o/r", "branch": "main"}, "server_id": server}),
+        json!({"name": "a", "git": {"url": "http://github.com/o/r", "branch": "main"}, "server_id": server}),
+        json!({"name": "a", "git": {"url": "https://github.com/o/r", "branch": "-x"}, "server_id": server}),
+    ] {
+        let r = call(&app, Method::POST, &path, &cookie, Some(body)).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text);
+    }
+    let svc = new_service(
+        &app,
+        &cookie,
+        &stack.env_id,
+        server,
+        json!({"name": "app", "git": {"url": "https://github.com/o/r", "branch": "main"}, "port": 3000}),
+    )
+    .await;
+    assert_eq!(svc["git"]["branch"], "main");
+    assert!(svc["image"].is_null());
+    let sid = svc["id"].as_str().unwrap().to_string();
+
+    let mut agent = Agent::connect(addr, &token).await;
+    agent.hello(vec![]).await;
+    let deploy_uri = format!("/api/v1/services/{sid}/deploy");
+    let deploy = || call(&app, Method::POST, &deploy_uri, &cookie, None);
+
+    // First deploy: the job carries the source, the agent reports the commit.
+    let r = deploy().await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text);
+    assert_eq!(r.json["git"]["url"], "https://github.com/o/r");
+    let first = r.json["id"].as_str().unwrap().to_string();
+    let first_id = Uuid::parse_str(&first).unwrap();
+    let ApiMessage::Deploy(job) = agent.next().await else {
+        panic!("expected a deploy job");
+    };
+    assert_eq!(job.source.unwrap().branch, "main");
+    assert!(job.spec.env.contains(&("PORT".into(), "3000".into())));
+    agent
+        .send(AgentMessage::Status(DeploymentReport {
+            deployment_id: first_id,
+            status: DeploymentStatus::Running,
+            vm_id: Some("vm-1".into()),
+            host_port: Some(30001),
+            error: None,
+            commit: Some("abc123".into()),
+        }))
+        .await;
+    let d = wait_status(&app, &cookie, &first, "running").await;
+    assert_eq!(d["commit"], "abc123");
+
+    // Second deploy fails to build: the first stays wanted and running.
+    let r = deploy().await;
+    let second = r.json["id"].as_str().unwrap().to_string();
+    let second_id = Uuid::parse_str(&second).unwrap();
+    let ApiMessage::Deploy(_) = agent.next().await else {
+        panic!("expected a deploy job");
+    };
+    agent
+        .send(AgentMessage::Logs {
+            deployment_id: second_id,
+            offset: 0,
+            len: 12,
+            text: "building...\n".into(),
+        })
+        .await;
+    agent
+        .send(AgentMessage::Status(DeploymentReport {
+            deployment_id: second_id,
+            status: DeploymentStatus::Failed,
+            vm_id: None,
+            host_port: None,
+            error: Some("Build failed".into()),
+            commit: None,
+        }))
+        .await;
+    let d = wait_status(&app, &cookie, &second, "failed").await;
+    assert_eq!(d["error"], "Build failed");
+    let logs = call(
+        &app,
+        Method::GET,
+        &format!("/api/v1/deployments/{second}/logs"),
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(logs.text, "building...\n");
+
+    assert_eq!(
+        deployment_status(&app, &cookie, &first).await["status"],
+        "running"
+    );
+    // Still wanted: a reconnect does not stop it.
+    drop(agent);
+    let mut agent = Agent::connect(addr, &token).await;
+    agent
+        .hello(vec![DeploymentReport {
+            deployment_id: first_id,
+            status: DeploymentStatus::Running,
+            vm_id: Some("vm-1".into()),
+            host_port: Some(30001),
+            error: None,
+            commit: Some("abc123".into()),
+        }])
+        .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        deployment_status(&app, &cookie, &first).await["status"],
+        "running"
+    );
+    let _ = &mut agent;
 }

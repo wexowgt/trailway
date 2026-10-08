@@ -5,7 +5,8 @@ use std::{
 };
 
 use trailway_agent::{
-    deploy::{Manager, SharedRuntime},
+    build::{DockerBuilder, FakeBuilder},
+    deploy::{Manager, SharedBuilder, SharedRuntime},
     firecracker::{Config as FcConfig, FirecrackerRuntime},
     runtime::FakeRuntime,
     session::{self, SessionError},
@@ -148,6 +149,13 @@ fn runtime() -> SharedRuntime {
     Arc::new(FirecrackerRuntime::new(FcConfig::from_env()))
 }
 
+fn builder(work_dir: PathBuf) -> SharedBuilder {
+    if host::fake_runtime() {
+        return Arc::new(FakeBuilder::default());
+    }
+    Arc::new(DockerBuilder::new(work_dir))
+}
+
 async fn run_loop(config_path: &Path, state_path: &Path) -> anyhow::Result<()> {
     let config = Config::load(config_path)?;
     let client = ApiClient::new(&config.api)?;
@@ -156,7 +164,8 @@ async fn run_loop(config_path: &Path, state_path: &Path) -> anyhow::Result<()> {
         None => register(&client, &config, state_path).await,
     };
     let record = state_path.with_file_name("deployments.json");
-    let manager = Manager::new(runtime(), Some(record));
+    let builds = state_path.with_file_name("builds");
+    let manager = Manager::new(runtime(), builder(builds), Some(record));
     let shared = Arc::new(Shared {
         client,
         config,

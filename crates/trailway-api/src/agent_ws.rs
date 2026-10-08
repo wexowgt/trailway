@@ -11,7 +11,7 @@ use axum::{
 };
 use sqlx::{types::Json as Jsonb, PgPool};
 use trailway_proto::{
-    AgentMessage, ApiMessage, DeployJob, DeploymentReport, DeploymentStatus, VmSpec,
+    AgentMessage, ApiMessage, DeployJob, DeploymentReport, DeploymentStatus, GitSource, VmSpec,
 };
 use uuid::Uuid;
 
@@ -90,11 +90,13 @@ async fn apply_report(
     r: &DeploymentReport,
 ) -> Result<(), sqlx::Error> {
     let status = r.status.as_str();
-    let desired: Option<String> = sqlx::query_scalar(
+    let updated: Option<(String, Option<Uuid>, Option<String>)> = sqlx::query_as(
         "UPDATE deployments SET status = $3, vm_id = COALESCE($4, vm_id), error = $6, \
+         commit_sha = COALESCE($7, commit_sha), \
          host_port = CASE WHEN $3 IN ('failed', 'stopped') THEN NULL ELSE COALESCE($5, host_port) END, \
          updated_at = now() \
-         WHERE id = $1 AND server_id = $2 AND status NOT IN ('failed', 'stopped') RETURNING desired",
+         WHERE id = $1 AND server_id = $2 AND status NOT IN ('failed', 'stopped') \
+         RETURNING desired, service_id, vm_id",
     )
     .bind(r.deployment_id)
     .bind(server_id)
@@ -102,8 +104,16 @@ async fn apply_report(
     .bind(&r.vm_id)
     .bind(r.host_port.map(i32::from))
     .bind(&r.error)
+    .bind(&r.commit)
     .fetch_optional(&state.pool)
     .await?;
+    let desired = updated.as_ref().map(|(d, _, _)| d.clone());
+    if let Some((_, Some(service_id), None)) = &updated {
+        // A build that never produced a VM must not take the running version down.
+        if r.status == DeploymentStatus::Failed && desired.as_deref() == Some("running") {
+            keep_previous(&state.pool, *service_id, r.deployment_id).await?;
+        }
+    }
     if desired.as_deref() == Some("stopped") && !r.status.is_terminal() {
         state.hub.send(
             server_id,
@@ -112,6 +122,27 @@ async fn apply_report(
             },
         );
     }
+    Ok(())
+}
+
+/// A deployment failed before it started a VM: its predecessor, which the
+/// deploy marked as unwanted but the agent has not stopped (it only does that
+/// once the new image is ready), becomes wanted again, unless a newer
+/// deployment or a stop has taken over since.
+async fn keep_previous(pool: &PgPool, service_id: Uuid, failed: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE deployments SET desired = 'running', updated_at = now() WHERE id = ( \
+           SELECT p.id FROM deployments p WHERE p.service_id = $1 AND p.id <> $2 \
+           AND p.desired = 'stopped' AND p.status = 'running' \
+           AND p.created_at < (SELECT created_at FROM deployments WHERE id = $2) \
+           ORDER BY p.created_at DESC LIMIT 1) \
+         AND NOT EXISTS (SELECT 1 FROM deployments n WHERE n.service_id = $1 AND n.id <> $2 \
+           AND n.desired = 'running' AND n.status NOT IN ('failed', 'stopped'))",
+    )
+    .bind(service_id)
+    .bind(failed)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -150,7 +181,14 @@ async fn store_logs(
     tx.commit().await
 }
 
-type Pending = (Uuid, Option<Uuid>, String, String, Jsonb<VmSpec>);
+type Pending = (
+    Uuid,
+    Option<Uuid>,
+    String,
+    String,
+    Jsonb<VmSpec>,
+    Option<Jsonb<GitSource>>,
+);
 
 /// Makes the database and the agent agree after a (re)connect: the agent's
 /// report wins for what is running, the database decides what should be.
@@ -166,13 +204,13 @@ async fn reconcile(
         reports.iter().map(|r| (r.deployment_id, r)).collect();
 
     let rows: Vec<Pending> = sqlx::query_as(
-        "SELECT id, service_id, status, desired, spec FROM deployments \
+        "SELECT id, service_id, status, desired, spec, source FROM deployments \
          WHERE server_id = $1 AND status NOT IN ('failed', 'stopped')",
     )
     .bind(server_id)
     .fetch_all(&state.pool)
     .await?;
-    for (id, service_id, status, desired, spec) in &rows {
+    for (id, service_id, status, desired, spec, source) in &rows {
         let report = reported.get(id);
         if desired == "stopped" {
             match report {
@@ -197,6 +235,7 @@ async fn reconcile(
                         deployment_id: *id,
                         service_id: service_id.unwrap_or(*id),
                         spec: spec.0.clone(),
+                        source: source.as_ref().map(|s| s.0.clone()),
                     }),
                 );
             }

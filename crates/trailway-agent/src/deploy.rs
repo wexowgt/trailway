@@ -3,7 +3,7 @@
 //! reconnect or an agent restart.
 
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -15,14 +15,17 @@ use trailway_proto::{
 };
 use uuid::Uuid;
 
-use crate::runtime::Runtime;
+use crate::{build::Builder, runtime::Runtime};
 
+/// Build output kept per deployment (bytes); the rest of a huge log is dropped.
+const MAX_BUILD_LOG: u64 = 8 * 1024 * 1024;
 /// Finished deployments kept in the record (oldest dropped first).
 const KEEP_FINISHED: usize = 100;
 const LOG_CHUNK: usize = 64 * 1024;
 const LOG_POLL: Duration = Duration::from_millis(500);
 
 pub type SharedRuntime = Arc<dyn Runtime + Send + Sync>;
+pub type SharedBuilder = Arc<dyn Builder + Send + Sync>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Entry {
@@ -32,6 +35,8 @@ struct Entry {
     vm_id: Option<String>,
     host_port: Option<u16>,
     error: Option<String>,
+    #[serde(default)]
+    commit: Option<String>,
 }
 
 impl Entry {
@@ -42,6 +47,7 @@ impl Entry {
             vm_id: self.vm_id.clone(),
             host_port: self.host_port,
             error: self.error.clone(),
+            commit: self.commit.clone(),
         }
     }
 
@@ -59,6 +65,13 @@ impl Entry {
 
 pub struct Manager {
     rt: SharedRuntime,
+    builder: SharedBuilder,
+    /// One file per git deployment with its build output; the VM's console
+    /// log continues it in the log the API shows.
+    log_dir: PathBuf,
+    /// Held while build output is appended and sent, and while a fresh
+    /// connection catches up on it, so no chunk is sent out of order.
+    log_lock: Mutex<()>,
     path: Option<PathBuf>,
     entries: Mutex<Vec<Entry>>,
     /// The live API connection, if any. Messages sent while there is none are
@@ -70,7 +83,11 @@ pub struct Manager {
 impl Manager {
     /// Loads the record from `path` (when given) and starts the job worker.
     /// Must be called inside a tokio runtime.
-    pub fn new(rt: SharedRuntime, path: Option<PathBuf>) -> Arc<Self> {
+    pub fn new(rt: SharedRuntime, builder: SharedBuilder, path: Option<PathBuf>) -> Arc<Self> {
+        let log_dir = match path.as_ref().and_then(|p| p.parent()) {
+            Some(dir) => dir.join("build-logs"),
+            None => std::env::temp_dir().join(format!("tw-build-logs-{}", Uuid::new_v4())),
+        };
         let mut entries: Vec<Entry> = path
             .as_ref()
             .and_then(|p| std::fs::read(p).ok())
@@ -87,6 +104,9 @@ impl Manager {
         let (jobs, rx) = unbounded_channel();
         let manager = Arc::new(Self {
             rt,
+            builder,
+            log_dir,
+            log_lock: Mutex::new(()),
             path,
             entries: Mutex::new(entries),
             sink: Mutex::new(None),
@@ -112,6 +132,7 @@ impl Manager {
                 vm_id: None,
                 host_port: None,
                 error: None,
+                commit: None,
             });
         }
         let _ = self.jobs.send(msg);
@@ -121,18 +142,33 @@ impl Manager {
     /// every deployment, then streams the logs of the running ones.
     pub fn attach(self: &Arc<Self>, sink: UnboundedSender<AgentMessage>) {
         self.refresh();
+        let _guard = self.log_lock.lock().unwrap();
         let _ = sink.send(AgentMessage::Hello {
             deployments: self.reports(),
         });
         *self.sink.lock().unwrap() = Some(sink.clone());
         for e in self.entries() {
-            if let (DeploymentStatus::Running, Some(vm_id)) = (e.status, e.vm_id) {
-                tokio::spawn(follow_logs(
-                    self.rt.clone(),
-                    e.deployment_id,
-                    vm_id,
-                    sink.clone(),
-                ));
+            match (e.status, e.vm_id) {
+                (DeploymentStatus::Running, Some(vm_id)) => {
+                    tokio::spawn(follow_logs(
+                        self.rt.clone(),
+                        e.deployment_id,
+                        vm_id,
+                        self.log_path(e.deployment_id),
+                        sink.clone(),
+                    ));
+                }
+                // Build output from while the API was not listening; chunks it
+                // already has are dropped there.
+                (
+                    DeploymentStatus::Building
+                    | DeploymentStatus::Deploying
+                    | DeploymentStatus::Failed,
+                    _,
+                ) => {
+                    send_log_file(&self.log_path(e.deployment_id), e.deployment_id, &sink);
+                }
+                _ => {}
             }
         }
     }
@@ -161,6 +197,40 @@ impl Manager {
                     e.error = Some("The VM exited".into());
                 });
             }
+        }
+    }
+
+    fn log_path(&self, id: Uuid) -> PathBuf {
+        self.log_dir.join(format!("{id}.log"))
+    }
+
+    /// Adds build output to the deployment's log file and sends it on.
+    fn append_log(&self, id: Uuid, text: &str) {
+        use std::io::Write;
+        let _guard = self.log_lock.lock().unwrap();
+        let path = self.log_path(id);
+        let written = (|| -> std::io::Result<u64> {
+            std::fs::create_dir_all(&self.log_dir)?;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)?;
+            let offset = file.metadata()?.len();
+            if offset >= MAX_BUILD_LOG {
+                return Ok(offset);
+            }
+            file.write_all(text.as_bytes())?;
+            Ok(offset)
+        })();
+        match written {
+            Ok(offset) if offset < MAX_BUILD_LOG => self.emit(AgentMessage::Logs {
+                deployment_id: id,
+                offset,
+                len: text.len() as u64,
+                text: text.to_string(),
+            }),
+            Ok(_) => {}
+            Err(e) => tracing::error!(deployment = %id, "could not store build log: {e}"),
         }
     }
 
@@ -258,7 +328,29 @@ impl Manager {
             })
         };
         set(DeploymentStatus::Building, None);
-        if let Err(e) = self.rt.prepare(&job.spec) {
+        let mut spec = job.spec.clone();
+        if let Some(source) = &job.source {
+            match self
+                .builder
+                .build(id, source, &mut |line| self.append_log(id, line))
+            {
+                Ok(built) => {
+                    spec.image = built.image;
+                    self.update(id, |e| e.commit = Some(built.commit));
+                }
+                Err(e) => {
+                    self.append_log(id, &format!("Build failed: {e:#}\n"));
+                    return set(
+                        DeploymentStatus::Failed,
+                        Some(format!("Build failed: {e:#}")),
+                    );
+                }
+            }
+        }
+        if let Err(e) = self.rt.prepare(&spec) {
+            if job.source.is_some() {
+                self.append_log(id, &format!("Could not prepare the image: {e:#}\n"));
+            }
             return set(DeploymentStatus::Failed, Some(format!("{e:#}")));
         }
 
@@ -271,7 +363,7 @@ impl Manager {
         {
             self.stop_vm(&old);
         }
-        let vm_id = match self.rt.start(&job.spec) {
+        let vm_id = match self.rt.start(&spec) {
             Ok(vm) => vm,
             Err(e) => return set(DeploymentStatus::Failed, Some(format!("{e:#}"))),
         };
@@ -287,7 +379,13 @@ impl Manager {
             e.host_port = host_port;
         });
         if let Some(sink) = self.sink.lock().unwrap().clone() {
-            tokio::spawn(follow_logs(self.rt.clone(), id, vm_id, sink));
+            tokio::spawn(follow_logs(
+                self.rt.clone(),
+                id,
+                vm_id,
+                self.log_path(id),
+                sink,
+            ));
         }
     }
 
@@ -304,6 +402,7 @@ impl Manager {
                 vm_id: None,
                 host_port: None,
                 error: None,
+                commit: None,
             })),
         }
     }
@@ -347,14 +446,51 @@ fn complete_lines(buf: &[u8], flush: bool) -> usize {
     }
 }
 
-/// Sends a deployment's console output to the API, from the start, until the
-/// VM is gone and the log is drained or the connection ends.
+/// Sends the stored build output of a deployment, in chunks of whole lines.
+/// Returns its size in bytes (0 when there is none).
+fn send_log_file(path: &Path, deployment_id: Uuid, sink: &UnboundedSender<AgentMessage>) -> u64 {
+    let Ok(bytes) = std::fs::read(path) else {
+        return 0;
+    };
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let rest = &bytes[offset..];
+        let window = &rest[..rest.len().min(LOG_CHUNK)];
+        let take = complete_lines(window, true);
+        let text = String::from_utf8_lossy(&window[..take]).into_owned();
+        let msg = AgentMessage::Logs {
+            deployment_id,
+            offset: offset as u64,
+            len: take as u64,
+            text,
+        };
+        if sink.send(msg).is_err() {
+            break;
+        }
+        offset += take;
+    }
+    bytes.len() as u64
+}
+
+/// Sends a deployment's log to the API, from the start, until the VM is gone
+/// and the log is drained or the connection ends: the build output first (if
+/// it was built from git), then the VM's console after it.
 async fn follow_logs(
     rt: SharedRuntime,
     deployment_id: Uuid,
     vm_id: String,
+    build_log: PathBuf,
     sink: UnboundedSender<AgentMessage>,
 ) {
+    let base = {
+        let sink = sink.clone();
+        tokio::task::spawn_blocking(move || {
+            // Not while a build line is being appended and sent.
+            send_log_file(&build_log, deployment_id, &sink)
+        })
+        .await
+        .unwrap_or(0)
+    };
     let mut offset = 0u64;
     loop {
         if sink.is_closed() {
@@ -388,7 +524,7 @@ async fn follow_logs(
         if take > 0 {
             let msg = AgentMessage::Logs {
                 deployment_id,
-                offset,
+                offset: base + offset,
                 len: take as u64,
                 text: String::from_utf8_lossy(&buf[..take]).into_owned(),
             };
@@ -407,7 +543,9 @@ async fn follow_logs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::build::FakeBuilder;
     use crate::runtime::{FakeRuntime, FAIL_IMAGE_PREFIX};
+    use trailway_proto::GitSource;
     use trailway_proto::VmSpec;
 
     fn spec(image: &str) -> VmSpec {
@@ -427,11 +565,22 @@ mod tests {
             deployment_id: Uuid::new_v4(),
             service_id: service,
             spec: spec(image),
+            source: None,
         }
     }
 
     fn manager(rt: Arc<FakeRuntime>, path: Option<PathBuf>) -> Arc<Manager> {
-        Manager::new(rt, path)
+        Manager::new(rt, Arc::new(FakeBuilder::default()), path)
+    }
+
+    fn git_job(service: Uuid, url: &str) -> DeployJob {
+        DeployJob {
+            source: Some(GitSource {
+                url: url.into(),
+                branch: "main".into(),
+            }),
+            ..job(service, "")
+        }
     }
 
     fn statuses(m: &Manager) -> Vec<(Uuid, DeploymentStatus)> {
@@ -602,6 +751,106 @@ mod tests {
                 break;
             }
         }
+    }
+
+    #[tokio::test]
+    async fn git_deploy_builds_then_runs_the_built_image_with_one_log() {
+        let rt = Arc::new(FakeRuntime::default());
+        let m = manager(rt.clone(), None);
+        let (tx, mut rx) = unbounded_channel();
+        m.attach(tx);
+        let j = git_job(Uuid::new_v4(), "https://github.com/o/app");
+        m.submit(ApiMessage::Deploy(j.clone()));
+        settle(&m).await;
+        let e = m.entry(j.deployment_id).unwrap();
+        assert_eq!(e.status, DeploymentStatus::Running);
+        assert!(e.commit.is_some());
+        let vm = rt.status(e.vm_id.as_deref().unwrap()).unwrap();
+        assert!(vm.spec.image.starts_with("docker-daemon:trailway-build/"));
+
+        // Build output first, then the VM's console, with contiguous offsets.
+        let mut log = String::new();
+        let mut statuses = vec![];
+        while log.matches("fake log").count() == 0 {
+            match rx.recv().await.unwrap() {
+                AgentMessage::Logs {
+                    offset, len, text, ..
+                } => {
+                    assert_eq!(len as usize, text.len());
+                    // The build log is sent live and again with the VM's log:
+                    // repeats are fine (the API drops them), gaps are not.
+                    assert!(offset as usize <= log.len(), "gap at {offset}");
+                    if offset as usize == log.len() {
+                        log.push_str(&text);
+                    }
+                }
+                AgentMessage::Status(r) => statuses.push(r.status),
+                AgentMessage::Hello { .. } => {}
+            }
+        }
+        assert!(log.starts_with("Cloning\nBuilding\n"), "{log}");
+        assert!(statuses.contains(&DeploymentStatus::Building));
+    }
+
+    #[tokio::test]
+    async fn failed_build_fails_the_deployment_and_keeps_the_old_vm() {
+        let rt = Arc::new(FakeRuntime::default());
+        let m = manager(rt.clone(), None);
+        let (tx, mut rx) = unbounded_channel();
+        m.attach(tx);
+        let service = Uuid::new_v4();
+        let ok = git_job(service, "https://github.com/o/app");
+        m.submit(ApiMessage::Deploy(ok.clone()));
+        settle(&m).await;
+        let old_vm = m.entry(ok.deployment_id).unwrap().vm_id.unwrap();
+
+        let bad = git_job(service, "https://github.com/o/broken");
+        m.submit(ApiMessage::Deploy(bad.clone()));
+        settle(&m).await;
+        let e = m.entry(bad.deployment_id).unwrap();
+        assert_eq!(e.status, DeploymentStatus::Failed);
+        assert!(e.error.unwrap().contains("Build failed"));
+        assert_eq!(rt.status(&old_vm).unwrap().state, VmState::Running);
+        assert_eq!(
+            m.entry(ok.deployment_id).unwrap().status,
+            DeploymentStatus::Running
+        );
+
+        let mut log = String::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let AgentMessage::Logs {
+                deployment_id,
+                text,
+                ..
+            } = msg
+            {
+                if deployment_id == bad.deployment_id {
+                    log.push_str(&text);
+                }
+            }
+        }
+        assert!(log.contains("the build exploded") && log.contains("Build failed"));
+    }
+
+    #[tokio::test]
+    async fn reconnect_resends_the_build_log_from_the_start() {
+        let m = manager(Arc::new(FakeRuntime::default()), None);
+        let bad = git_job(Uuid::new_v4(), "https://github.com/o/broken");
+        m.submit(ApiMessage::Deploy(bad.clone()));
+        settle(&m).await;
+        let (tx, mut rx) = unbounded_channel();
+        m.attach(tx);
+        let mut text = String::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let AgentMessage::Logs {
+                offset, text: t, ..
+            } = msg
+            {
+                assert_eq!(offset as usize, text.len());
+                text.push_str(&t);
+            }
+        }
+        assert!(text.starts_with("Cloning\n") && text.contains("Build failed"));
     }
 
     #[test]
